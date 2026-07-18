@@ -31,15 +31,14 @@ TEAMS_SEED = [
 # Xarita koordinatalari (rasmning % nuqtalari: x — chapdan, y — tepadan)
 # v4: rasm PIRS.png ga almashtirildi (butunlay boshqa rakurs) — quyidagi raqamlar
 # admin XARITA bo'limida rasm ustiga bosib aniqlangan HAQIQIY koordinatalar
-# (2026-07-19 da joyida kalibrlangan). Favvora rasmda alohida belgilanmagan —
-# hali taxminiy, kerak bo'lsa joyida aniqlab shu yerga yozing.
+# (2026-07-19 da joyida kalibrlangan, hammasi tasdiqlangan).
 MAP_XY = {
     START_PT:                 (54.7, 55.1),   # Administratsiya
     "Befit Eco":              (47.5, 38.8),
     "Kuzatuv maydonchasi":    (47.5, 22.5),
     "Pirs":                   (75.9, 57.9),
     "Amfiteatr":              (49.7, 47.7),
-    "Favvora":                (31.5, 19.0),   # taxminiy — rasmda yorlig'i yo'q, kalibrlang
+    "Favvora":                (80.8, 67.8),
     "Yoga terassasi":         (35.7, 38.7),
     "Piknik zonasi":          (38.2, 26.4),
     "Ochiq trenajyorlar":     (61.4, 53.6),
