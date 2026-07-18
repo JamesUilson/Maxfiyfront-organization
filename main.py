@@ -857,6 +857,7 @@ function teamCard(t, ctx){
 
 // ============ XARITA (admin) ============
 function shortName(n){ return n.replace("FINISH · ","🏁 ").replace(" maydonchasi","").replace(" zonasi",""); }
+const LEG_EST_SEC = 180; // taxminiy yurish davomiyligi (soniya) — chiziq bo'ylab silliq harakat uchun
 function teamPos(t, XY){
   // "kutmoqda" = admin umumiy STARTni hali bermagan — jamoa eshik oldida turibdi
   if(t.status==="kutmoqda")   return {p:XY[STATE.start_pt], from:null, wait:true};
@@ -864,7 +865,12 @@ function teamPos(t, XY){
   const target = XY[t.expected_loc];
   if(t.status==="nuqtada") return {p:target, from:null};
   const from = t.stage===1 ? XY[STATE.start_pt] : XY[t.route[t.stage-2]];
-  return {p:[(from[0]+target[0])/2,(from[1]+target[1])/2], from:from, to:target, walk:true};
+  // vaqtga qarab chiziq bo'ylab siljiydi (hech qachon 92% dan oshmaydi —
+  // haqiqiy yetib kelish faqat koordinator "Yetib keldi" bosganda qayd etiladi)
+  const elapsed = liveLeg(t) || 0;
+  const frac = Math.min(0.92, elapsed / LEG_EST_SEC);
+  const p = [from[0]+(target[0]-from[0])*frac, from[1]+(target[1]-from[1])*frac];
+  return {p, from:from, to:target, walk:true};
 }
 function mapView(){
   const XY = STATE.map_xy;
@@ -876,17 +882,32 @@ function mapView(){
   }
   // jamoa yo'nalish chiziqlari (SVG overlay) + markerlar
   let lines = "", marks = "";
-  const occupied = {};
-  STATE.teams.forEach(t=>{
-    const pos = teamPos(t, XY);
+  // 1-pass: pozitsiyalarni oldindan hisoblab, bir xil nuqtaga to'g'ri kelganlarni guruhlaymiz
+  const positions = STATE.teams.map(t=>({t, pos: teamPos(t, XY)}));
+  const groups = {};
+  positions.forEach(({t,pos})=>{
+    const key = Math.round(pos.p[0]/3)+"_"+Math.round(pos.p[1]/3);
+    (groups[key] = groups[key] || []).push(t.id);
+  });
+  const seenInGroup = {};
+  positions.forEach(({t,pos})=>{
     if(pos.walk){
       lines += `<line x1="${pos.from[0]}" y1="${pos.from[1]}" x2="${pos.to[0]}" y2="${pos.to[1]}"
         stroke="${t.color}" stroke-width=".45" stroke-dasharray="1.6 1.2" opacity=".8"
         vector-effect="non-scaling-stroke"/>`;
     }
     const key = Math.round(pos.p[0]/3)+"_"+Math.round(pos.p[1]/3);
-    const n = occupied[key]||0; occupied[key]=n+1;
-    const dx = (n%3)*4.2 - 4.2, dy = Math.floor(n/3)*4.5;
+    const groupSize = groups[key].length;
+    const n = seenInGroup[key] || 0; seenInGroup[key] = n+1;
+    // YAKKA jamoa uchun HECH QANDAY siljish yo'q — aniq kalibrlangan nuqtaga tushadi.
+    // Bir nechta jamoa bir joyga to'g'ri kelsa, guruh markazidan simmetrik taqsimlanadi.
+    let dx = 0, dy = 0;
+    if(groupSize > 1){
+      const col = n % 3, row = Math.floor(n/3);
+      const colsInRow = Math.min(groupSize - row*3, 3);
+      dx = (col - (colsInRow-1)/2) * 4.5;
+      dy = row * 4.5;
+    }
     marks += `<div class="tmark${pos.walk?" walking":""}"
       style="left:${pos.p[0]+dx}%; top:${pos.p[1]+dy}%">
       <div class="dot" style="background:${t.color}">${t.name[0]}</div>
