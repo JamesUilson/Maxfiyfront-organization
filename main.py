@@ -30,19 +30,20 @@ TEAMS_SEED = [
 
 # Xarita koordinatalari (rasmning % nuqtalari: x — chapdan, y — tepadan)
 # v4: rasm PIRS.png ga almashtirildi (butunlay boshqa rakurs) — quyidagi raqamlar
-# rasmni ko'zdan kechirib qo'yilgan TAXMINIY qiymatlar. Tadbirdan oldin ALBATTA
-# admin XARITA bo'limida rasm ustiga bosib chiqqan % koordinatalar bilan moslang.
+# admin XARITA bo'limida rasm ustiga bosib aniqlangan HAQIQIY koordinatalar
+# (2026-07-19 da joyida kalibrlangan). Favvora rasmda alohida belgilanmagan —
+# hali taxminiy, kerak bo'lsa joyida aniqlab shu yerga yozing.
 MAP_XY = {
-    START_PT:                 (48.0, 40.0),   # Administratsiya — taxminiy, kalibrlang
-    "Befit Eco":              (49.5, 49.7),   # taxminiy — kalibrlang
-    "Kuzatuv maydonchasi":    (47.8, 20.0),   # taxminiy — kalibrlang
-    "Pirs":                   (92.8, 60.0),   # taxminiy — kalibrlang
-    "Amfiteatr":              (53.8, 58.7),   # taxminiy — kalibrlang
-    "Favvora":                (31.5, 19.0),   # taxminiy — kalibrlang
-    "Yoga terassasi":         (36.0, 40.0),   # taxminiy — kalibrlang
-    "Piknik zonasi":          (17.5, 26.3),   # taxminiy — kalibrlang
-    "Ochiq trenajyorlar":     (60.8, 55.3),   # taxminiy — kalibrlang
-    FINISH:                   (39.5, 17.3),   # Bolalar eko maydonchasi — taxminiy, kalibrlang
+    START_PT:                 (54.7, 55.1),   # Administratsiya
+    "Befit Eco":              (47.5, 38.8),
+    "Kuzatuv maydonchasi":    (47.5, 22.5),
+    "Pirs":                   (75.9, 57.9),
+    "Amfiteatr":              (49.7, 47.7),
+    "Favvora":                (31.5, 19.0),   # taxminiy — rasmda yorlig'i yo'q, kalibrlang
+    "Yoga terassasi":         (35.7, 38.7),
+    "Piknik zonasi":          (38.2, 26.4),
+    "Ochiq trenajyorlar":     (61.4, 53.6),
+    FINISH:                   (38.2, 17.9),   # Bolalar eko (sport) maydonchasi
 }
 # Koordinator tanlaydigan nuqtalar
 KOORD_LOCS = ["Befit Eco", "Kuzatuv maydonchasi", "Pirs", "Amfiteatr", "Favvora",
@@ -113,6 +114,7 @@ def team_state(team, events, now):
         t = e["type"]
         if t == "start":
             st["start_ts"] = e["ts"]
+            st["status"] = "yolda"  # admin umumiy START berdi — jamoa 1-nuqtaga yo'lda
         elif t == "arrive":
             stages[e["stage"]-1]["arrive"] = e["ts"]
             st["status"] = "nuqtada"; st["stage"] = e["stage"]
@@ -135,7 +137,7 @@ def team_state(team, events, now):
                 "arrived": s["arrive"] is not None,
                 "departed": s["depart"] is not None,
                 "travel_sec": None, "stay_sec": None}
-        if s["arrive"] and prev and s["n"] > 1:
+        if s["arrive"] and prev:
             item["travel_sec"] = int(s["arrive"] - prev)
         if s["arrive"]:
             end = s["depart"] or (st["finish_ts"] if s["n"] == 4 else None) or now
@@ -174,13 +176,16 @@ def full_state():
     c.close()
     board = sorted(out, key=lambda s: (-s["coins"],
                    s["total_sec"] if s["start_ts"] else 10**9))
+    starts = [s["start_ts"] for s in out if s["start_ts"]]
     return {"now": now, "teams": out, "board": [s["id"] for s in board],
             "log": [dict(r) for r in log],
             "map_xy": MAP_XY, "koord_locs": KOORD_LOCS,
-            "start_pt": START_PT, "finish_pt": FINISH}
+            "start_pt": START_PT, "finish_pt": FINISH,
+            "global_start_ts": min(starts) if starts else None,
+            "all_started": len(starts) == len(out)}
 
 LABELS = {
-    "start": "START — 1-nuqtaga yetib keldi", "arrive": "Hududga yetib keldi",
+    "start": "START — jamoa yo'lga tushdi", "arrive": "Hududga yetib keldi",
     "kazus": "Kazus to'g'ri yechildi", "depart": "Keyingi nuqtaga yo'lga chiqdi",
     "hint": "Mentor ishorasi olindi", "traitor_ok": "Xoin TO'G'RI topildi",
     "traitor_no": "Xoin topilmadi", "finish": "Operatsiya yakunlandi",
@@ -235,12 +240,15 @@ async def action(request: Request):
         c.close(); raise HTTPException(403, "Faqat shtab (admin)")
     if act == "hint" and role not in ("admin", "mentor"):
         c.close(); raise HTTPException(403, "Faqat mentor")
-    if act in ("start", "arrive", "kazus", "depart", "traitor_ok", "traitor_no",
+    if act == "start" and role != "admin":
+        c.close(); raise HTTPException(
+            403, "START faqat admin orqali beriladi (umumiy START tugmasi)")
+    if act in ("arrive", "kazus", "depart", "traitor_ok", "traitor_no",
                "finish") and role not in ("admin", "koordinator"):
         c.close(); raise HTTPException(403, "Faqat koordinator")
 
     # koordinator faqat O'Z nuqtasidagi jamoa bilan ishlaydi
-    if role == "koordinator" and act in ("start", "arrive", "kazus", "depart",
+    if role == "koordinator" and act in ("arrive", "kazus", "depart",
                                           "traitor_ok", "traitor_no", "finish"):
         if not loc:
             c.close(); raise HTTPException(
@@ -250,23 +258,20 @@ async def action(request: Request):
                 400, "Bu jamoa sizning nuqtangizga tegishli emas")
 
     if act == "start":
-        # jamoa 1-nuqtaga YETIB KELGANDA koordinator bosadi:
-        # taymer shu ondan boshlanadi + 1-hudud topildi (+1)
+        # BARCHA jamoalar eshik oldidan birga yo'lga tushadi — odatda
+        # /api/admin/start_all orqali hammasi birga boshlanadi. Bu yakka
+        # amal faqat admin uchun zaxira (masalan kechikkan jamoa uchun).
         if st["start_ts"]:
             c.close(); raise HTTPException(400, "Allaqachon boshlangan")
         ts = time.time()
-        start_actor = role + (" @ " + loc if loc else "")
         c.execute("INSERT INTO events(team_id,type,stage,delta,note,actor,ts) "
                   "VALUES(?,?,?,?,?,?,?)",
-                  (tid, "start", 1, 0, LABELS["start"], start_actor, ts))
-        c.execute("INSERT INTO events(team_id,type,stage,delta,note,actor,ts) "
-                  "VALUES(?,?,?,?,?,?,?)",
-                  (tid, "arrive", 1, COIN_ARRIVE, "1-hudud topildi", start_actor, ts))
+                  (tid, "start", 1, 0, LABELS["start"], role, ts))
         c.commit(); c.close()
         return {"ok": True}
     elif act == "arrive":
         if not st["start_ts"]:
-            c.close(); raise HTTPException(400, "Avval 1-nuqtada START berilsin")
+            c.close(); raise HTTPException(400, "Avval admin umumiy STARTni bersin")
         if st["status"] != "yolda":
             c.close(); raise HTTPException(400, "Jamoa yo'lda emas")
         delta = COIN_ARRIVE
@@ -320,6 +325,29 @@ async def action(request: Request):
               (tid, act, stage, delta, note, actor, time.time()))
     c.commit(); c.close()
     return {"ok": True}
+
+@app.post("/api/admin/start_all")
+async def start_all(request: Request):
+    """Barcha jamoalar eshik oldidan birga yo'lga tushadi — admin BIR marta
+    bosadi, hali boshlanmagan jamoalarning hammasi SHU ondan taymer oladi."""
+    require(request, ("admin",))
+    c = db()
+    teams = c.execute("SELECT * FROM teams").fetchall()
+    ts = time.time()
+    started = 0
+    for t in teams:
+        evs = c.execute("SELECT * FROM events WHERE team_id=? ORDER BY id",
+                        (t["id"],)).fetchall()
+        st = team_state(t, evs, ts)
+        if st["start_ts"]:
+            continue
+        c.execute("INSERT INTO events(team_id,type,stage,delta,note,actor,ts) "
+                  "VALUES(?,?,?,?,?,?,?)",
+                  (t["id"], "start", 1, 0,
+                   "OPERATSIYA START — barcha jamoalar yo'lga tushdi", "admin", ts))
+        started += 1
+    c.commit(); c.close()
+    return {"ok": True, "started": started}
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MAP_SRC = os.path.join(BASE_DIR, "PIRS.png")          # asl rasm
@@ -649,7 +677,7 @@ const CONF = {
   traitor_ok: "Xoin TO'G'RI topildi? (+3)",
   traitor_no: "Xoin topilmadi? (-1)",
   undo: "Oxirgi amal bekor qilinsinmi?",
-  start: "Jamoa 1-nuqtaga yetib keldi. START berilsinmi? Taymer shu ondan yuradi."
+  start: "Bu jamoaga ALOHIDA START berilsinmi? (odatda umumiy START tugmasi ishlatiladi — bu faqat kechikkan jamoa uchun zaxira)"
 };
 function fmt(sec){
   if(sec==null) return "--:--";
@@ -672,34 +700,44 @@ function loginView(msg){
   <div class="login">
     <h1>OPERATSIYA «SOYA»</h1>
     <div class="sub">SHTAB BOSHQARUV PANELI</div>
-    <input id="pin" type="password" inputmode="numeric" placeholder="····" maxlength="8">
+    <input id="pin" type="password" inputmode="numeric" placeholder="····" maxlength="8"
+      autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" name="soya-pin">
     <button class="primary" onclick="doLogin()">KIRISH</button>
     <div class="err">${msg||""}</div>
   </div>`;
   $("#pin").focus();
   $("#pin").addEventListener("keydown", e=>{ if(e.key==="Enter") doLogin(); });
 }
+let LOGGING_IN = false;
 async function doLogin(){
+  if(LOGGING_IN) return;               // ikki marta bosilsa-da bitta so'rov
+  const btn = document.querySelector(".login button.primary");
+  LOGGING_IN = true;
+  if(btn){ btn.disabled = true; btn.textContent = "..."; }
   try{
     const pin = $("#pin").value.trim();
     const r = await fetch("/api/login",{method:"POST",
       headers:{"Content-Type":"application/json"}, body:JSON.stringify({pin})});
-    if(!r.ok) throw 0;
+    if(!r.ok) throw new Error("bad_pin");
     const d = await r.json();
     PIN = pin; ROLE = d.role;
     sessionStorage.setItem("soya_pin", PIN);
     sessionStorage.setItem("soya_role", ROLE);
     if(ROLE==="koordinator"){
-      const cs = await api("/api/coord/state");
+      // login MUVAFFAQIYATLI o'tdi — keyingi (coord/state) so'rov tarmoq
+      // xatosiga uchrasa ham buni "PIN noto'g'ri" deb ko'rsatmaymiz.
+      let cs = {loc:null};
+      try{ cs = await api("/api/coord/state"); }catch(e){}
       if(cs.loc){ MYLOC=cs.loc; sessionStorage.setItem("soya_loc", MYLOC); boot(); }
       else locPicker(d.locs);
       return;
     }
     boot();
   }catch(e){ loginView("PIN noto'g'ri"); }
+  finally{ LOGGING_IN = false; }
 }
 function locPicker(locs){
-  const btns = locs.map(l=>`<button onclick="setLoc(this.dataset.l)" data-l="${l}">${l.replace("FINISH · ","🏁 ")}</button>`).join("");
+  const btns = locs.map(l=>`<button onclick="setLoc(this.dataset.l,this)" data-l="${l}">${l.replace("FINISH · ","🏁 ")}</button>`).join("");
   $("#app").innerHTML = `
   <div class="login" style="max-width:400px">
     <h1>NUQTANGIZ?</h1>
@@ -708,9 +746,13 @@ function locPicker(locs){
     <div class="err" id="locerr"></div>
   </div>`;
 }
-async function setLoc(l){
+async function setLoc(l, btnEl){
+  if(btnEl) btnEl.disabled = true;
   try{ await api("/api/coord/loc", {loc:l}); MYLOC=l; sessionStorage.setItem("soya_loc", l); boot(); }
-  catch(e){ const el=$("#locerr"); if(el) el.textContent=e.message; else alert(e.message); }
+  catch(e){
+    const el=$("#locerr"); if(el) el.textContent=e.message; else alert(e.message);
+    if(btnEl) btnEl.disabled = false;
+  }
 }
 function logout(){ sessionStorage.clear(); PIN=""; ROLE=""; MYLOC="";
   clearInterval(TICK); loginView(); }
@@ -741,6 +783,14 @@ function liveLeg(t){
   if(t.status==="yolda"||t.status==="nuqtada") return t.leg_sec + (nowSec()-STATE.now);
   return null;
 }
+function liveGlobal(){
+  return STATE.global_start_ts ? (nowSec() - STATE.global_start_ts) : null;
+}
+async function startAll(){
+  if(!confirm("BARCHA jamoalarga umumiy START berilsinmi? Barcha taymerlar shu ondan boshlanadi.")) return;
+  try{ await api("/api/admin/start_all", {}); await refresh(); }
+  catch(e){ alert(e.message); }
+}
 
 // ============ JAMOA KARTASI ============
 function teamCard(t, ctx){
@@ -758,8 +808,8 @@ function teamCard(t, ctx){
   let btns = "";
   const canOps = (ROLE==="admin") || (ROLE==="koordinator" && t.expected_loc===MYLOC);
   if(canOps){
-    if(t.status==="kutmoqda")
-      btns += `<button class="primary big" onclick="act('${t.id}','start')">▶ START — yetib keldi (+1)</button>`;
+    if(t.status==="kutmoqda" && ROLE==="admin")
+      btns += `<button class="small" onclick="act('${t.id}','start')">▶ START (yakka — kechikkan jamoa uchun)</button>`;
     if(t.status==="yolda" && t.start_ts)
       btns += `<button class="good big" onclick="act('${t.id}','arrive')">📍 Yetib keldi (+1)</button>`;
     if(t.status==="nuqtada" && t.stage<4){
@@ -808,7 +858,8 @@ function teamCard(t, ctx){
 // ============ XARITA (admin) ============
 function shortName(n){ return n.replace("FINISH · ","🏁 ").replace(" maydonchasi","").replace(" zonasi",""); }
 function teamPos(t, XY){
-  if(t.status==="kutmoqda")   return {p:XY[t.route[0]], from:null, wait:true};
+  // "kutmoqda" = admin umumiy STARTni hali bermagan — jamoa eshik oldida turibdi
+  if(t.status==="kutmoqda")   return {p:XY[STATE.start_pt], from:null, wait:true};
   if(t.status==="yakunlandi") return {p:XY[STATE.finish_pt], from:null};
   const target = XY[t.expected_loc];
   if(t.status==="nuqtada") return {p:target, from:null};
@@ -844,7 +895,7 @@ function mapView(){
   const leg = STATE.teams.map(t=>{
     const stt = t.status==="yolda" ? "yolda ➜ "+shortName(t.expected_loc)
              : t.status==="nuqtada" ? "📍 "+shortName(t.expected_loc)
-             : t.status==="kutmoqda" ? "⏳ startni kutmoqda ("+shortName(t.route[0])+")"
+             : t.status==="kutmoqda" ? "⏳ eshik oldida, START kutilmoqda → "+shortName(t.route[0])
              : t.status;
     return `<div class="it"><span class="dotc" style="background:${t.color}"></span>
       <b>${t.name}</b> · ${stt} · 🪙${t.coins} · ${fmt(liveTotal(t))} · 💡${t.hints}</div>`;
@@ -1003,13 +1054,26 @@ function render(){
   else if(TAB==="coords") body = coordsView();
   const locBadge = ROLE==="koordinator"
     ? `<span class="pill" title="Lokatsiya faqat admin tomonidan o'zgartiriladi">📍 ${(MYLOC||"?").replace("FINISH · ","🏁 ")}</span>` : "";
+  let masterBar = "";
+  if(STATE.global_start_ts){
+    masterBar = `<div class="card" style="padding:10px 14px; display:flex; justify-content:space-between; align-items:center; margin-bottom:12px">
+      <span style="font-family:ui-monospace,monospace; letter-spacing:1px">⏱ OPERATSIYA VAQTI</span>
+      <span style="font-family:ui-monospace,monospace; font-size:22px; font-weight:bold">${fmt(liveGlobal())}</span>
+    </div>`;
+  } else if(ROLE==="admin"){
+    masterBar = `<div class="card" style="padding:12px; text-align:center">
+      <button class="primary big" style="width:100%" onclick="startAll()">🚀 BARCHA JAMOALARGA START BERISH</button>
+    </div>`;
+  } else {
+    masterBar = `<div class="card" style="padding:10px 14px; text-align:center; font-family:ui-monospace,monospace; opacity:.7">⏳ Admin umumiy STARTni kutilmoqda…</div>`;
+  }
   $("#app").innerHTML = `
   <header><div class="t">☰ «SOYA»</div>
     <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
       ${locBadge}<span class="role">${ROLE}</span>
       <button class="small" onclick="logout()">chiqish</button>
     </div></header>
-  <main>${tabs}${body}</main>
+  <main>${masterBar}${tabs}${body}</main>
   <footer><span>Antinarko shtabi · jonli panel</span><span id="clock"></span></footer>`;
   $("#clock").textContent = new Date().toLocaleTimeString("uz-UZ");
 }
@@ -1029,9 +1093,14 @@ if(PIN && ROLE){
   if(ROLE==="koordinator"){
     api("/api/coord/state").then(cs=>{
       if(cs.loc){ MYLOC=cs.loc; sessionStorage.setItem("soya_loc", MYLOC); boot(); }
+      else if(MYLOC){ boot(); }  // avvalgi lokatsiya keshda bor — davom etamiz
       else fetch("/api/login",{method:"POST",headers:{"Content-Type":"application/json"},
         body:JSON.stringify({pin:PIN})}).then(r=>r.json()).then(d=>locPicker(d.locs));
-    }).catch(()=>loginView());
+    }).catch(()=>{
+      // tarmoq xatosi: sessiyani buzmaymiz — keshdagi lokatsiya bilan davom etamiz,
+      // faqat u ham bo'lmasa loginga qaytamiz.
+      if(MYLOC) boot(); else loginView();
+    });
   } else boot();
 } else loginView();
 </script>
