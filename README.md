@@ -112,3 +112,36 @@ Telefonlar shu Wi-Fi/hotspotdagi `http://KOMPYUTER_IP:8100` manziliga kiradi.
   ko'rsatadi. To'liq radar/kompas uchun tadbirni HTTPS orqali (masalan
   AlwaysData deploy, yoki lokal tarmoq uchun mkcert/ngrok/Tailscale kabi
   vositalar bilan) joylashtirish tavsiya etiladi.
+
+## v6 yangiliklari — RADAR/KOMPAS TUZATISH VA REAL GPS XARITASI
+- 🎯 **Radar qayta ishlab chiqildi (canvas asosida)**: endi signal chizig'i QIZIL
+  rangda aylanadi va mentor nuqtasi FAQAT signal ustidan o'tayotganda yonadi,
+  o'tib ketgach so'nib yo'qoladi (haqiqiy samolyot radari kabi) — avvalgi
+  versiyada nuqta doim ko'rinib turardi va dizayn sxematik edi.
+- 📍 **GPS aniqligi shaffof ko'rsatiladi**: radar ekranida "±N m aniqlik" belgisi
+  chiqadi; aniqlik >50m bo'lsa telefon sozlamalarida "Aniq lokatsiya" (Precise
+  Location, iOS/Android'da alohida yoqiladigan sozlama) yoqilganini tekshirish
+  tavsiya etiladi — masofa xatosining eng keng tarqalgan sababi shu (taxminiy
+  lokatsiya rejimida xato 100+ metrgacha yetishi mumkin). Shuningdek so'nggi
+  o'lchovlar aniqlikka qarab og'irlashtirilgan o'rtacha bilan silliqlanadi
+  (GPS "sakrashi"ni kamaytiradi), past aniqlikdagi keskin xato o'lchovlar
+  chetlab o'tiladi.
+- 🧭 **Kompas tuzatildi**: signal topilmasa (qurilma qo'llab-quvvatlamasa yoki
+  ruxsat berilmagan bo'lsa) endi aniq "kompas topilmadi" deb yozadi — avval
+  sukut bo'yicha 0° da "muzlab qolgandek" ko'rinib, ishlamayotgandek tuyular edi.
+  Kompas endi N/E/S/W belgilari va gradus ko'rsatkichi bilan chiroyli chizilgan.
+- 🗺 **Admin: INTERAKTIV / REAL (GPS) xarita almashtirgichi**. "XARITA"
+  bo'limida endi ikkita rejim bor:
+  - **INTERAKTIV** — avvalgidek, o'yin holatiga asoslangan taxminiy pozitsiya.
+  - **REAL (GPS)** — ishtirokchilar, mentorlar va koordinatorlarning HAQIQIY
+    jonli GPS pozitsiyalari **xuddi shu pirs.jpg rasmiga** proyeksiya qilinadi
+    (internet/xarita-plitkalarisiz — tadbir odatda internetsiz lokal Wi-Fi'da
+    o'tishi uchun eng amaliy yechim). Buning uchun admin kamida 3 ta ma'lum
+    nuqtada (masalan Administratsiya, FINISH va Pirs) jismonan turib "📍 Shu
+    yerda GPS olish" tugmasini bosib GPS "kalibrlash" qiladi — shundan keyin
+    tizim avtomatik proyeksiya (eng kichik kvadratlar affin transformatsiyasi)
+    hisoblaydi. Koordinatorlar allaqachon MA'LUM nuqtasiga biriktirilgani
+    uchun ularga alohida GPS kerak emas — nuqtasi asosida avtomatik ko'rinadi.
+  - Ishtirokchi jamoasini tanlagach, uning telefoni ILOVA ochiq turgan
+    davomida (RADAR bo'limida bo'lmasa ham) fonda jonli GPS'ini serverga
+    yuboradi — shu orqali admin REAL xaritada uni ko'ra oladi.
