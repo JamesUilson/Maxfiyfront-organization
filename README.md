@@ -43,6 +43,26 @@ uvicorn main:app --host 0.0.0.0 --port 8100
 ```
 Telefonlar shu Wi-Fi/hotspotdagi `http://KOMPYUTER_IP:8100` manziliga kiradi.
 
+⚠️ **Bu oddiy HTTP rejimi — GPS (radar) va kompas ISHLAMAYDI**, chunki
+brauzerlar bu ikkalasini faqat xavfsiz (HTTPS) kontekstda beradi. Agar
+ISHTIROKCHI radari, kompas yoki MENTOR/REAL xarita kerak bo'lsa, pastdagi
+HTTPS rejimidan foydalaning.
+
+## HTTPS bilan ishga tushirish (RADAR/KOMPAS uchun TAVSIYA ETILADI)
+```bash
+pip install -r requirements.txt
+python3 run_https.py
+```
+Birinchi marta ishga tushganda avtomatik o'z-o'zini imzolagan sertifikat
+(`cert.pem`, `key.pem`) yaratiladi (`openssl` kerak, ko'pchilik Mac/Linux'da
+allaqachon o'rnatilgan). Bu **internetga ehtiyoj sezmaydi** — oddiy lokal
+Wi-Fi/hotspotda ham ishlaydi. Telefonlar endi `https://KOMPYUTER_IP:8100`
+manziliga kiradi. Birinchi ochilishda brauzer "ulanish xavfsiz emas" deb
+ogohlantiradi (sertifikat o'z-o'zidan imzolangani uchun, bu normal) —
+**"Qo'shimcha" (Advanced) → "Baribir davom etish" (Proceed)** tugmasini bir
+marta bosish kifoya, shundan keyin GPS/kompasga to'liq ruxsat beriladi va
+sayt odatdagidek ishlayveradi.
+
 ## AlwaysData'ga deploy
 1. Fayllarni yuklang (`main.py`, `requirements.txt`).
 2. `pip install --user -r requirements.txt`
@@ -145,3 +165,16 @@ Telefonlar shu Wi-Fi/hotspotdagi `http://KOMPYUTER_IP:8100` manziliga kiradi.
   - Ishtirokchi jamoasini tanlagach, uning telefoni ILOVA ochiq turgan
     davomida (RADAR bo'limida bo'lmasa ham) fonda jonli GPS'ini serverga
     yuboradi — shu orqali admin REAL xaritada uni ko'ra oladi.
+
+## v7 yangiliklari — HTTPS (GPS/KOMPAS UCHUN) VA MENTOR XARITADA KO'RINISHI
+- 🔐 **`python3 run_https.py`** — internetsiz ham ishlaydigan, o'z-o'zini
+  imzolagan HTTPS ishga tushirish skripti (batafsili yuqorida). "Kompas
+  topilmadi" muammosining asosiy sababi ko'pincha HTTP orqali kirilishi edi —
+  GPS/DeviceOrientation ko'pchilik brauzerlarda faqat xavfsiz kontekstda ishlaydi.
+- 🗺 **Mentor endi INTERAKTIV xaritada ham ko'rinadi** (avval faqat REAL
+  rejimda ko'rinardi) — GPS kalibrlash tayyor bo'lsa, onlayn mentor(lar)
+  qaysi xarita rejimida turishidan qat'i nazar 🟤 "M" nishoni bilan chiqadi.
+- 🎯 Xarita nishonlari endi rasm chegarasidan (0–100%) chiqib "yo'qolib
+  qolmasligi" uchun 2–98% oralig'ida ushlab turiladi (kalibrlash nuqtalari
+  chekka bo'lganda ba'zi GPS proyeksiyalari chegaradan chiqib, ko'rinmas
+  bo'lib qolishi mumkin edi).

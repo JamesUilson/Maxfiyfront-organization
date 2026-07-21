@@ -442,6 +442,35 @@ def ensure_map_optimized():
 
 ensure_map_optimized()
 
+# ================= HTTPS uchun o'z-o'zini imzolagan sertifikat =================
+# GPS (Geolocation) va kompas (DeviceOrientation) ko'pchilik brauzerlarda FAQAT
+# xavfsiz kontekst (https:// yoki localhost)da ishlaydi. Tadbir odatda internetsiz
+# lokal Wi-Fi/hotspot orqali o'tgani uchun internetga bog'liq (Let's Encrypt kabi)
+# sertifikat olib bo'lmaydi — shuning uchun ishga tushganda avtomatik O'Z-O'ZINI
+# IMZOLAGAN sertifikat yasaladi (agar `openssl` mavjud bo'lsa). Bu internetsiz ham
+# ishlaydi: telefon brauzeri "ulanish xavfsiz emas" deb bir marta ogohlantiradi,
+# foydalanuvchi "Baribir davom etish"ni bosgach GPS/kompasga to'liq ruxsat beriladi.
+CERT_FILE = os.path.join(BASE_DIR, "cert.pem")
+KEY_FILE = os.path.join(BASE_DIR, "key.pem")
+
+def ensure_self_signed_cert():
+    if os.path.exists(CERT_FILE) and os.path.exists(KEY_FILE):
+        return
+    import subprocess, shutil
+    if not shutil.which("openssl"):
+        return
+    try:
+        subprocess.run([
+            "openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+            "-days", "3650",
+            "-keyout", KEY_FILE, "-out", CERT_FILE,
+            "-subj", "/CN=soya-shtab",
+        ], check=True, capture_output=True, timeout=30)
+    except Exception:
+        pass
+
+ensure_self_signed_cert()
+
 @app.get("/pirs.jpg")
 async def map_img():
     if os.path.exists(MAP_IMG):
@@ -1268,6 +1297,17 @@ function teamPos(t, XY){
   return {p, from:from, to:target, walk:true};
 }
 let MAP_MODE = "interaktiv", LIVE_POS = null, GEOCAL = null;
+function clampPct(v){ return Math.max(2, Math.min(98, v)); }  // rasm chegarasidan chiqib "yo'qolib qolmasin"
+function mentorPinsOverlay(){
+  // Onlayn mentorlarni (agar GPS kalibrlash tayyor bo'lsa) HAR IKKI xarita rejimida
+  // ko'rsatadi — admin qaysi rejimda bo'lishidan qat'i nazar mentorni topa oladi.
+  const lp = LIVE_POS || {mentors:[]};
+  return lp.mentors.filter(m=>m.pos).map(m=>
+    `<div class="tmark mentorpin" style="left:${clampPct(m.pos.x)}%; top:${clampPct(m.pos.y)}%">
+      <div class="dot" style="background:#8a6a1a">M</div>
+      <div class="tag">Mentor ${m.id}${m.acc!=null?` ±${Math.round(m.acc)}m`:""}</div></div>`
+  ).join("");
+}
 function mapView(){
   const toggle = `<div class="maptoggle">
     <button class="${MAP_MODE==='interaktiv'?'on':''}" onclick="MAP_MODE='interaktiv';render()">🗺 INTERAKTIV</button>
@@ -1331,11 +1371,12 @@ function interaktivMapView(){
   <div class="mapwrap2" id="mapwrap" onclick="mapClick(event)">
     <img src="/pirs.jpg" alt="Eco Park">
     <svg class="ovl" viewBox="0 0 100 100" preserveAspectRatio="none">${lines}</svg>
-    ${lmarks}${marks}
+    ${lmarks}${marks}${mentorPinsOverlay()}
   </div>
   <div class="maplegend" style="border:2px solid var(--line); border-top:none">${leg}</div>
   <div style="font-family:ui-monospace,monospace; font-size:10.5px; color:#6b5327; margin-top:8px">
-  Pulsatsiya — harakatda · ⏳ — 1-nuqtasida START kutilmoqda · shtrix chiziq — joriy yo'nalish<br>
+  Pulsatsiya — harakatda · ⏳ — 1-nuqtasida START kutilmoqda · shtrix chiziq — joriy yo'nalish ·
+  <span style="color:#8a6a1a">⬤ M</span> — onlayn mentor (jonli GPS)<br>
   Kalibrlash: rasm ustiga bossangiz % koordinata ko'rinadi (MAP_XY ga yozish uchun)</div>
   `;
 }
@@ -1361,16 +1402,11 @@ function realMapView(){
   const lp = LIVE_POS || {users:[], mentors:[], coordinators:[], transform_ready:false};
   let marks = "";
   lp.coordinators.forEach(c=>{
-    marks += `<div class="tmark coordpin" style="left:${c.x}%; top:${c.y}%">
+    marks += `<div class="tmark coordpin" style="left:${clampPct(c.x)}%; top:${clampPct(c.y)}%">
       <div class="dot" style="background:${c.online?'#144d33':'#6b5327'}">K</div>
       <div class="tag">Koordinator · ${c.loc.replace("FINISH · ","🏁 ")}</div></div>`;
   });
-  lp.mentors.forEach(m=>{
-    if(!m.pos) return;
-    marks += `<div class="tmark mentorpin" style="left:${m.pos.x}%; top:${m.pos.y}%">
-      <div class="dot" style="background:#8a6a1a">M</div>
-      <div class="tag">Mentor ${m.id}${m.acc!=null?` ±${Math.round(m.acc)}m`:""}</div></div>`;
-  });
+  marks += mentorPinsOverlay();
   const withPos = lp.users.filter(u=>u.pos);
   const ugroups = {};
   withPos.forEach(u=>{
@@ -1388,7 +1424,7 @@ function realMapView(){
       const colsInRow=Math.min(groupSize-row*3,3);
       dx=(col-(colsInRow-1)/2)*3.2; dy=row*3.2;
     }
-    marks += `<div class="tmark" style="left:${u.pos.x+dx}%; top:${u.pos.y+dy}%">
+    marks += `<div class="tmark" style="left:${clampPct(u.pos.x+dx)}%; top:${clampPct(u.pos.y+dy)}%">
       <div class="dot" style="background:${u.team_color||'#555'}; width:16px; height:16px; font-size:9px">${(u.team_name||"?")[0]}</div>
       <div class="tag">${u.team_name||"?"}${u.acc!=null?` ±${Math.round(u.acc)}m`:""}</div></div>`;
   });
