@@ -15,6 +15,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, FileResponse, Streamin
 ADMIN_PIN  = "2026"
 KOORD_PIN  = "1122"
 MENTOR_PIN = "3344"
+USER_PIN   = "7788"
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "soya.db")
 
 FINISH = "FINISH · Bolalar eko maydonchasi"
@@ -73,6 +74,10 @@ def init_db():
         note TEXT, actor TEXT, ts REAL);
     CREATE TABLE IF NOT EXISTS coordinators(
         token TEXT PRIMARY KEY, loc TEXT, last_seen REAL);
+    CREATE TABLE IF NOT EXISTS users(
+        token TEXT PRIMARY KEY, team_id TEXT, last_seen REAL);
+    CREATE TABLE IF NOT EXISTS mentors(
+        token TEXT PRIMARY KEY, lat REAL, lon REAL, last_seen REAL);
     """)
     if c.execute("SELECT COUNT(*) n FROM teams").fetchone()["n"] == 0:
         for tid, name, color, route in TEAMS_SEED:
@@ -88,6 +93,7 @@ def role_of(request: Request):
     if pin == ADMIN_PIN:  return "admin"
     if pin == KOORD_PIN:  return "koordinator"
     if pin == MENTOR_PIN: return "mentor"
+    if pin == USER_PIN:   return "user"
     return None
 
 def require(request: Request, roles):
@@ -188,21 +194,26 @@ LABELS = {
     "kazus": "Kazus to'g'ri yechildi", "depart": "Keyingi nuqtaga yo'lga chiqdi",
     "hint": "Mentor ishorasi olindi", "traitor_ok": "Xoin TO'G'RI topildi",
     "traitor_no": "Xoin topilmadi", "finish": "Operatsiya yakunlandi",
-    "adjust": "Qo'lda tuzatish",
+    "adjust": "Qo'lda tuzatish", "help_request": "🆘 Mentordan yordam so'raldi",
 }
 
 @app.post("/api/login")
 async def login(request: Request):
     body = await request.json()
     pin = body.get("pin", "")
-    for p, r in ((ADMIN_PIN, "admin"), (KOORD_PIN, "koordinator"), (MENTOR_PIN, "mentor")):
+    c = db()
+    teams = [dict(id=t["id"], name=t["name"], color=t["color"])
+             for t in c.execute("SELECT id,name,color FROM teams").fetchall()]
+    c.close()
+    for p, r in ((ADMIN_PIN, "admin"), (KOORD_PIN, "koordinator"),
+                 (MENTOR_PIN, "mentor"), (USER_PIN, "user")):
         if pin == p:
-            return {"role": r, "locs": KOORD_LOCS}
+            return {"role": r, "locs": KOORD_LOCS, "teams": teams}
     raise HTTPException(401, "PIN noto'g'ri")
 
 @app.get("/api/state")
 async def state(request: Request):
-    require(request, ("admin", "koordinator", "mentor"))
+    require(request, ("admin", "koordinator", "mentor", "user"))
     return JSONResponse(full_state())
 
 @app.post("/api/action")
@@ -455,6 +466,145 @@ async def admin_set_coord_loc(request: Request):
     c.commit(); c.close()
     return {"ok": True}
 
+# ================= FOYDALANUVCHI (jamoaga qulflangan qurilma) =================
+@app.get("/api/user/state")
+async def user_state(request: Request):
+    require(request, ("user", "admin"))
+    token = request.headers.get("X-User-Token", "")
+    c = db()
+    row = c.execute("SELECT team_id FROM users WHERE token=?", (token,)).fetchone()
+    c.close()
+    return {"team_id": row["team_id"] if row else None}
+
+@app.post("/api/user/team")
+async def user_set_team(request: Request):
+    require(request, ("user",))
+    body = await request.json()
+    token = request.headers.get("X-User-Token", "")
+    team_id = body.get("team_id")
+    if not token:
+        raise HTTPException(400, "Qurilma ID topilmadi")
+    c = db()
+    if not c.execute("SELECT id FROM teams WHERE id=?", (team_id,)).fetchone():
+        c.close(); raise HTTPException(400, "Noma'lum jamoa")
+    row = c.execute("SELECT team_id FROM users WHERE token=?", (token,)).fetchone()
+    if row and row["team_id"]:
+        c.close()
+        raise HTTPException(
+            403, "Jamoangiz allaqachon tanlangan. O'zgartirish uchun ADMINga murojaat qiling.")
+    now = time.time()
+    if row:
+        c.execute("UPDATE users SET team_id=?, last_seen=? WHERE token=?", (team_id, now, token))
+    else:
+        c.execute("INSERT INTO users(token,team_id,last_seen) VALUES(?,?,?)", (token, team_id, now))
+    c.commit(); c.close()
+    return {"ok": True}
+
+@app.post("/api/user/help")
+async def user_help(request: Request):
+    require(request, ("user",))
+    token = request.headers.get("X-User-Token", "")
+    c = db()
+    row = c.execute("SELECT team_id FROM users WHERE token=?", (token,)).fetchone()
+    if not row or not row["team_id"]:
+        c.close(); raise HTTPException(400, "Avval jamoangizni tanlang")
+    team = c.execute("SELECT * FROM teams WHERE id=?", (row["team_id"],)).fetchone()
+    evs = c.execute("SELECT * FROM events WHERE team_id=? ORDER BY id", (team["id"],)).fetchall()
+    st = team_state(team, evs, time.time())
+    if st["status"] in ("kutmoqda", "yakunlandi"):
+        c.close(); raise HTTPException(400, "O'yin faol emas")
+    c.execute("UPDATE users SET last_seen=? WHERE token=?", (time.time(), token))
+    c.execute("INSERT INTO events(team_id,type,stage,delta,note,actor,ts) "
+              "VALUES(?,?,?,?,?,?,?)",
+              (team["id"], "help_request", 0, 0, LABELS["help_request"],
+               "ishtirokchi @ " + team["name"], time.time()))
+    c.commit(); c.close()
+    return {"ok": True}
+
+@app.get("/api/admin/users")
+async def admin_users(request: Request):
+    require(request, ("admin",))
+    c = db()
+    rows = c.execute(
+        "SELECT u.token, u.team_id, u.last_seen, t.name tname, t.color tcolor "
+        "FROM users u LEFT JOIN teams t ON t.id=u.team_id ORDER BY u.last_seen DESC").fetchall()
+    teams = [dict(id=t["id"], name=t["name"], color=t["color"])
+             for t in c.execute("SELECT id,name,color FROM teams").fetchall()]
+    c.close()
+    now = time.time()
+    return {
+        "users": [
+            {"token": r["token"], "team_id": r["team_id"], "team_name": r["tname"],
+             "team_color": r["tcolor"], "last_seen": r["last_seen"],
+             "online": bool(r["last_seen"] and (now - r["last_seen"]) < 60)}
+            for r in rows
+        ],
+        "teams": teams,
+    }
+
+@app.post("/api/admin/user/setteam")
+async def admin_set_user_team(request: Request):
+    require(request, ("admin",))
+    body = await request.json()
+    token, team_id = body.get("token"), body.get("team_id")
+    if not token:
+        raise HTTPException(400, "token yo'q")
+    c = db()
+    if not c.execute("SELECT id FROM teams WHERE id=?", (team_id,)).fetchone():
+        c.close(); raise HTTPException(400, "Noma'lum jamoa")
+    row = c.execute("SELECT token FROM users WHERE token=?", (token,)).fetchone()
+    now = time.time()
+    if row:
+        c.execute("UPDATE users SET team_id=?, last_seen=? WHERE token=?", (team_id, now, token))
+    else:
+        c.execute("INSERT INTO users(token,team_id,last_seen) VALUES(?,?,?)", (token, team_id, now))
+    c.commit(); c.close()
+    return {"ok": True}
+
+# ================= MENTOR RADAR (mentorning jonli GPS lokatsiyasi) =================
+@app.post("/api/mentor/beacon")
+async def mentor_beacon(request: Request):
+    require(request, ("mentor",))
+    body = await request.json()
+    token = request.headers.get("X-Mentor-Token", "")
+    if not token:
+        raise HTTPException(400, "Qurilma ID topilmadi")
+    c = db()
+    if body.get("online") is False:
+        c.execute("DELETE FROM mentors WHERE token=?", (token,))
+        c.commit(); c.close()
+        return {"ok": True}
+    lat, lon = body.get("lat"), body.get("lon")
+    if lat is None or lon is None:
+        c.close(); raise HTTPException(400, "lat/lon yo'q")
+    now = time.time()
+    row = c.execute("SELECT token FROM mentors WHERE token=?", (token,)).fetchone()
+    if row:
+        c.execute("UPDATE mentors SET lat=?, lon=?, last_seen=? WHERE token=?",
+                  (lat, lon, now, token))
+    else:
+        c.execute("INSERT INTO mentors(token,lat,lon,last_seen) VALUES(?,?,?,?)",
+                  (token, lat, lon, now))
+    c.commit(); c.close()
+    return {"ok": True}
+
+@app.get("/api/mentors/online")
+async def mentors_online(request: Request):
+    require(request, ("user", "admin", "koordinator", "mentor"))
+    c = db()
+    # token bo'yicha barqaror tartib — shu bilan "Mentor N" raqami har so'rovda
+    # last_seen o'zgarishi tufayli boshqa mentorga sakramaydi.
+    rows = c.execute(
+        "SELECT token, lat, lon, last_seen FROM mentors ORDER BY token ASC").fetchall()
+    c.close()
+    now = time.time()
+    out = []
+    for r in rows:
+        if not r["last_seen"] or (now - r["last_seen"]) >= 60:
+            continue
+        out.append({"id": len(out)+1, "lat": r["lat"], "lon": r["lon"], "last_seen": r["last_seen"]})
+    return {"mentors": out}
+
 # ================= ADMIN: NATIJALARNI YUKLAB OLISH (ZIP) =================
 def _fmt_dur(sec):
     if sec is None:
@@ -652,6 +802,51 @@ footer{position:fixed; bottom:0; left:0; right:0; background:var(--ink); color:v
 .sect{font-family:ui-monospace,monospace; font-size:11px; letter-spacing:2px;
   color:var(--line); text-transform:uppercase; margin:14px 0 8px; border-bottom:1.5px dashed var(--line); padding-bottom:3px}
 @media(max-width:560px){ .timers .val{font-size:17px} .card .name{font-size:15px} }
+/* ===== user / radar / mentor ===== */
+.rankbanner{background:var(--ink); color:var(--paper); padding:16px; text-align:center;
+  border:2px solid var(--line); box-shadow:4px 4px 0 rgba(107,83,39,.3); margin-bottom:14px}
+.rankbanner .big{font-family:ui-monospace,monospace; font-size:34px; font-weight:bold; letter-spacing:1px}
+.rankbanner .sm{font-family:ui-monospace,monospace; font-size:11px; letter-spacing:1px; opacity:.75; margin-top:4px}
+.board tr.mine{background:#fdf3d0}
+.board tr.mine td{font-weight:bold}
+button.sos{background:var(--red); color:#fff; border-color:var(--red); width:100%; font-size:15px; padding:14px}
+.radarwrap{display:flex; flex-direction:column; align-items:center; gap:14px; padding:10px 0}
+.radarbox{position:relative; width:min(92vw,340px); height:min(92vw,340px); border-radius:50%;
+  background:radial-gradient(circle, #0f2410 0%, #081a0a 70%, #051205 100%);
+  border:3px solid var(--line); box-shadow:0 0 0 4px rgba(107,83,39,.2), inset 0 0 30px rgba(0,0,0,.6);
+  overflow:hidden}
+.radarbox .ring{position:absolute; border:1px solid rgba(120,220,140,.35); border-radius:50%;
+  top:50%; left:50%; transform:translate(-50%,-50%)}
+.radarbox .cross{position:absolute; background:rgba(120,220,140,.25)}
+.radarbox .sweep{position:absolute; top:50%; left:50%; width:50%; height:2px; transform-origin:0 50%;
+  background:linear-gradient(90deg, rgba(120,255,140,.95), rgba(120,255,140,0));
+  animation:sweep 3.2s linear infinite}
+@keyframes sweep{from{transform:rotate(0deg)} to{transform:rotate(360deg)}}
+.radarbox .blip{position:absolute; width:14px; height:14px; margin:-7px; border-radius:50%;
+  background:#ffd23f; box-shadow:0 0 8px 3px rgba(255,210,63,.85); display:flex;
+  align-items:center; justify-content:center; font-size:9px; font-weight:bold; color:#2b241a;
+  animation:blip 1.4s ease-in-out infinite}
+@keyframes blip{0%,100%{opacity:1} 50%{opacity:.45}}
+.radarbox .blip .tag{position:absolute; top:16px; white-space:nowrap; font-family:ui-monospace,monospace;
+  font-size:9.5px; color:#ffd23f; background:rgba(0,0,0,.55); padding:1px 5px; border-radius:2px}
+.radarbox .me{position:absolute; top:50%; left:50%; width:10px; height:10px; margin:-5px;
+  border-radius:50%; background:#fff; box-shadow:0 0 6px 2px rgba(255,255,255,.8)}
+.compass{width:120px; height:120px; border-radius:50%; border:3px solid var(--line);
+  background:var(--paper2); position:relative; box-shadow:4px 4px 0 rgba(107,83,39,.25)}
+.compass .needle{position:absolute; top:8%; left:50%; width:0; height:0; transform-origin:50% 92%;
+  border-left:7px solid transparent; border-right:7px solid transparent; border-bottom:44px solid var(--red);
+  margin-left:-7px}
+.compass .n{position:absolute; top:4px; left:50%; transform:translateX(-50%); font-family:ui-monospace,monospace;
+  font-size:11px; font-weight:bold; color:var(--red)}
+.radarstatus{font-family:ui-monospace,monospace; font-size:12px; text-align:center; color:var(--line); max-width:340px}
+.radarlist{width:100%; max-width:340px}
+.radarlist .it{background:var(--paper2); border:1.5px solid var(--line); padding:8px 10px;
+  margin-bottom:6px; font-family:ui-monospace,monospace; font-size:12px; display:flex; justify-content:space-between}
+.helpfeed{background:#3a1414; color:#f3d9d9; font-family:ui-monospace,monospace; font-size:12px;
+  padding:10px; border:2px solid var(--red); margin-bottom:12px; max-height:160px; overflow:auto}
+.helpfeed .row{padding:3px 0; border-bottom:1px dashed rgba(243,217,217,.25)}
+.onlinebar{display:flex; align-items:center; justify-content:space-between; gap:8px;
+  background:var(--paper2); border:2px solid var(--line); padding:10px 12px; margin-bottom:12px}
 </style>
 </head>
 <body>
@@ -661,15 +856,22 @@ const $ = s => document.querySelector(s);
 let PIN = sessionStorage.getItem("soya_pin") || "";
 let ROLE = sessionStorage.getItem("soya_role") || "";
 let MYLOC = sessionStorage.getItem("soya_loc") || "";
-let STATE = null, COORDS = null, TAB = "", TICK = null, OFFSET = 0;
+let MYTEAM = sessionStorage.getItem("soya_team") || "";
+let STATE = null, COORDS = null, USERS = null, MENTORS = null, TAB = "", TICK = null, OFFSET = 0;
 
-// Koordinator qurilmasi uchun doimiy ID (lokatsiya shunga bog'lanadi va qulflanadi)
-let CTOKEN = localStorage.getItem("soya_ctoken") || "";
-if(!CTOKEN){
-  CTOKEN = (crypto.randomUUID ? crypto.randomUUID()
-    : "c-" + Date.now() + "-" + Math.random().toString(16).slice(2));
-  localStorage.setItem("soya_ctoken", CTOKEN);
+function devId(key){
+  let v = localStorage.getItem(key) || "";
+  if(!v){
+    v = (crypto.randomUUID ? crypto.randomUUID()
+      : "d-" + Date.now() + "-" + Math.random().toString(16).slice(2));
+    localStorage.setItem(key, v);
+  }
+  return v;
 }
+// Koordinator/foydalanuvchi/mentor qurilmasi uchun doimiy ID (lokatsiya/jamoa shunga bog'lanadi)
+let CTOKEN = devId("soya_ctoken");
+let UTOKEN = devId("soya_utoken");
+let MTOKEN = devId("soya_mtoken");
 
 const CONF = {
   hint: "Ishora berildi, -1 coin. Tasdiqlaysizmi?",
@@ -686,7 +888,8 @@ function fmt(sec){
   return String(m).padStart(2,"0")+":"+String(s).padStart(2,"0");
 }
 async function api(path, body){
-  const opt = {headers:{"X-Pin":PIN,"X-Coord-Token":CTOKEN,"Content-Type":"application/json"}};
+  const opt = {headers:{"X-Pin":PIN,"X-Coord-Token":CTOKEN,"X-User-Token":UTOKEN,
+    "X-Mentor-Token":MTOKEN,"Content-Type":"application/json"}};
   if(body){opt.method="POST"; opt.body=JSON.stringify(body);}
   const r = await fetch(path, opt);
   if(!r.ok){ const e = await r.json().catch(()=>({detail:"Xato"}));
@@ -731,6 +934,13 @@ async function doLogin(){
       else locPicker(d.locs);
       return;
     }
+    if(ROLE==="user"){
+      let us = {team_id:null};
+      try{ us = await api("/api/user/state"); }catch(e){}
+      if(us.team_id){ MYTEAM=us.team_id; sessionStorage.setItem("soya_team", MYTEAM); boot(); }
+      else teamPicker(d.teams);
+      return;
+    }
     boot();
   }catch(e){ loginView("PIN noto'g'ri"); }
   finally{ LOGGING_IN = false; }
@@ -753,14 +963,39 @@ async function setLoc(l, btnEl){
     if(btnEl) btnEl.disabled = false;
   }
 }
-function logout(){ sessionStorage.clear(); PIN=""; ROLE=""; MYLOC="";
-  clearInterval(TICK); loginView(); }
+function teamPicker(teams){
+  const btns = teams.map(t=>
+    `<button onclick="setTeam('${t.id}',this)" style="border-color:${t.color}; color:${t.color}">«${t.name}»</button>`
+  ).join("");
+  $("#app").innerHTML = `
+  <div class="login" style="max-width:400px">
+    <h1>JAMOANGIZ?</h1>
+    <div class="sub">O'Z JAMOANGIZNI TANLANG — FAQAT BIR MARTA TANLANADI</div>
+    <div class="locgrid">${btns}</div>
+    <div class="err" id="locerr"></div>
+  </div>`;
+}
+async function setTeam(id, btnEl){
+  if(btnEl) btnEl.disabled = true;
+  try{ await api("/api/user/team", {team_id:id}); MYTEAM=id; sessionStorage.setItem("soya_team", id); boot(); }
+  catch(e){
+    const el=$("#locerr"); if(el) el.textContent=e.message; else alert(e.message);
+    if(btnEl) btnEl.disabled = false;
+  }
+}
+function logout(){
+  if(MENTOR_ONLINE) mentorGoOffline();  // qurilma GPS kuzatuvini to'xtatib, serverga oflayn ekanini bildiradi
+  sessionStorage.clear(); PIN=""; ROLE=""; MYLOC=""; MYTEAM="";
+  clearInterval(TICK); stopRadar(); loginView();
+}
 
 async function refresh(){
   try{ STATE = await api("/api/state");
     OFFSET = Date.now()/1000 - STATE.now;
     if(ROLE==="admin"){
       try{ COORDS = await api("/api/admin/coordinators"); }catch(e){}
+      try{ USERS = await api("/api/admin/users"); }catch(e){}
+      try{ MENTORS = await api("/api/mentors/online"); }catch(e){}
     }
     if(ROLE==="koordinator"){
       try{ const cs = await api("/api/coord/state");
@@ -826,6 +1061,8 @@ function teamCard(t, ctx){
   }
   if((ROLE==="mentor"||ROLE==="admin") && running)
     btns += `<button class="bad" onclick="act('${t.id}','hint')">💡 Ishora (−1)</button>`;
+  if(ROLE==="user" && t.id===MYTEAM && running)
+    btns += `<button class="sos" onclick="requestHelp()">🆘 Mentordan yordam so'rash</button>`;
   if(ROLE==="admin"){
     btns += `<button class="small" onclick="act('${t.id}','adjust',{delta:1})">+1</button>`;
     btns += `<button class="small" onclick="act('${t.id}','adjust',{delta:-1})">−1</button>`;
@@ -975,6 +1212,202 @@ function koordView(){
   return html;
 }
 
+// ============ FOYDALANUVCHI (jamoa a'zosi) ko'rinishi ============
+function userHomeView(){
+  const mine = STATE.teams.find(t=>t.id===MYTEAM);
+  if(!mine) return `<div class="card" style="padding:18px">Jamoa topilmadi.</div>`;
+  const pos = STATE.board.indexOf(MYTEAM) + 1;
+  const medals = ["🥇","🥈","🥉","④","⑤"];
+  const banner = `<div class="rankbanner">
+    <div class="big">${medals[pos-1]||("#"+pos)} — ${pos}-O'RIN</div>
+    <div class="sm">${STATE.teams.length} jamoadan · reyting: coin ko'p, vaqt kam</div></div>`;
+  return banner + teamCard(mine);
+}
+let HELP_SENDING = false;
+async function requestHelp(){
+  if(HELP_SENDING) return;
+  if(!confirm("Mentordan yordam so'ralsinmi? Onlayn mentorlarga signal ketadi.")) return;
+  HELP_SENDING = true;
+  try{ await api("/api/user/help", {}); alert("Yordam so'rovi yuborildi! Radar bo'limidan eng yaqin mentorni toping."); }
+  catch(e){ alert(e.message); }
+  finally{ HELP_SENDING = false; }
+}
+
+// ============ RADAR (foydalanuvchi mentorni GPS+kompas orqali topadi) ============
+let RADAR_WATCH = null, RADAR_HEADING = null, MY_POS = null, RADAR_TIMER = null, RADAR_ON = false;
+function toRad(d){ return d*Math.PI/180; }
+function toDeg(r){ return r*180/Math.PI; }
+function haversine(lat1,lon1,lat2,lon2){
+  const R=6371000, dLat=toRad(lat2-lat1), dLon=toRad(lon2-lon1);
+  const a=Math.sin(dLat/2)**2 + Math.cos(toRad(lat1))*Math.cos(toRad(lat2))*Math.sin(dLon/2)**2;
+  return R*2*Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+}
+function bearingTo(lat1,lon1,lat2,lon2){
+  const y = Math.sin(toRad(lon2-lon1))*Math.cos(toRad(lat2));
+  const x = Math.cos(toRad(lat1))*Math.sin(toRad(lat2)) - Math.sin(toRad(lat1))*Math.cos(toRad(lat2))*Math.cos(toRad(lon2-lon1));
+  return (toDeg(Math.atan2(y,x))+360)%360;
+}
+function distLabel(m){ return m<1000 ? Math.round(m)+" m" : (m/1000).toFixed(2)+" km"; }
+function onOrientation(e){
+  let h = null;
+  if(typeof e.webkitCompassHeading === "number") h = e.webkitCompassHeading;      // iOS Safari
+  else if(e.absolute && e.alpha!=null) h = (360 - e.alpha) % 360;                  // Android (yo'nalish)
+  else if(e.alpha!=null) h = (360 - e.alpha) % 360;
+  if(h!=null){ RADAR_HEADING = h; if(TAB==="radar") renderRadar(); }
+}
+async function startRadar(){
+  RADAR_ON = true;
+  render();
+  const st = $("#radarstatus");
+  if(!navigator.geolocation){
+    if(st) st.textContent = "Bu qurilmada GPS (Geolocation) qo'llab-quvvatlanmaydi.";
+    return;
+  }
+  try{
+    if(typeof DeviceOrientationEvent !== "undefined" && typeof DeviceOrientationEvent.requestPermission === "function"){
+      const p = await DeviceOrientationEvent.requestPermission();
+      if(p !== "granted" && st) st.textContent = "Kompasga ruxsat berilmadi — masofa ko'rinadi, yo'nalishsiz.";
+    }
+  }catch(e){}
+  window.addEventListener("deviceorientationabsolute", onOrientation, true);
+  window.addEventListener("deviceorientation", onOrientation, true);
+  RADAR_WATCH = navigator.geolocation.watchPosition(
+    pos => { MY_POS = {lat:pos.coords.latitude, lon:pos.coords.longitude}; if(TAB==="radar") renderRadar(); },
+    err => { if(st) st.textContent = "GPS xatosi: " + err.message + " (HTTPS talab qilinishi mumkin)"; },
+    {enableHighAccuracy:true, maximumAge:4000, timeout:15000});
+  clearInterval(RADAR_TIMER);
+  RADAR_TIMER = setInterval(async ()=>{
+    try{ MENTORS = await api("/api/mentors/online"); if(TAB==="radar") renderRadar(); }catch(e){}
+  }, 4000);
+  try{ MENTORS = await api("/api/mentors/online"); }catch(e){}
+  renderRadar();
+}
+function pauseRadarWatch(){
+  // GPS/kompas kuzatuvini vaqtincha to'xtatadi (batareya tejash uchun) — RADAR_ON
+  // holatini o'zgartirmaydi, shu bilan foydalanuvchi RADAR bo'limiga qaytganda
+  // qayta ruxsat so'ramasdan avtomatik davom etadi.
+  if(RADAR_WATCH!=null && navigator.geolocation) navigator.geolocation.clearWatch(RADAR_WATCH);
+  RADAR_WATCH = null;
+  clearInterval(RADAR_TIMER); RADAR_TIMER = null;
+  window.removeEventListener("deviceorientationabsolute", onOrientation, true);
+  window.removeEventListener("deviceorientation", onOrientation, true);
+}
+function stopRadar(){
+  pauseRadarWatch();
+  RADAR_ON = false;
+  MY_POS = null; RADAR_HEADING = null;
+}
+function switchTab(t){
+  if(TAB==="radar" && t!=="radar" && RADAR_ON) pauseRadarWatch();
+  TAB = t;
+  if(TAB==="radar" && RADAR_ON) startRadar();  // oldin yoqilgan bo'lsa qayta ruxsat so'ramay davom etadi
+  else render();
+}
+function radarView(){
+  return `<h2 class="sec">📡 Mentor radari</h2>
+  <div class="radarwrap">
+    <div class="radarstatus" id="radarstatus">
+      ${RADAR_ON ? "Radar yoqilgan — atrofdagi onlayn mentorlarni izlamoqda…"
+                 : "Radarni yoqib, onlayn mentorlarni GPS orqali toping (samolyot radari kabi)."}
+    </div>
+    ${RADAR_ON ? "" : `<button class="primary big" onclick="startRadar()">📡 Radarni yoqish</button>`}
+    <div id="radarhost"></div>
+  </div>`;
+}
+function renderRadar(){
+  const host = document.getElementById("radarhost");
+  if(!host) return;
+  const st = document.getElementById("radarstatus");
+  const mentors = (MENTORS && MENTORS.mentors) || [];
+  if(!MY_POS){
+    if(st && RADAR_ON) st.textContent = "GPS signal kutilmoqda…";
+    host.innerHTML = mentorListFallback(mentors);
+    return;
+  }
+  if(st) st.textContent = mentors.length
+    ? mentors.length + " ta mentor onlayn topildi."
+    : "Hozircha hech bir mentor onlayn emas.";
+  const RADIUS = 150, MAXM = 800; // radar radiusi (px) va shkalasi (metr)
+  const heading = RADAR_HEADING || 0;
+  let blips = "";
+  mentors.forEach(m=>{
+    const d = haversine(MY_POS.lat, MY_POS.lon, m.lat, m.lon);
+    const brg = bearingTo(MY_POS.lat, MY_POS.lon, m.lat, m.lon);
+    const rel = (brg - heading + 360) % 360;
+    const r = Math.min(1, d / MAXM) * (RADIUS - 14);
+    const rad = toRad(rel - 90); // ekranda 0° = yuqoriga (shimolga/oldinga)
+    const x = RADIUS + r*Math.cos(rad), y = RADIUS + r*Math.sin(rad);
+    blips += `<div class="blip" style="left:${x}px; top:${y}px">M
+      <div class="tag">Mentor ${m.id} · ${distLabel(d)}</div></div>`;
+  });
+  host.innerHTML = `
+  <div class="radarbox" style="width:${RADIUS*2}px; height:${RADIUS*2}px">
+    <div class="ring" style="width:33%; height:33%"></div>
+    <div class="ring" style="width:66%; height:66%"></div>
+    <div class="ring" style="width:100%; height:100%"></div>
+    <div class="sweep"></div>
+    ${blips}
+    <div class="me"></div>
+  </div>
+  <div class="compass">
+    <div class="n">N</div>
+    <div class="needle" style="transform:rotate(${-heading}deg)"></div>
+  </div>
+  ${mentorListFallback(mentors)}`;
+}
+function mentorListFallback(mentors){
+  if(!mentors.length) return "";
+  const rows = mentors.map(m=>{
+    let extra = "";
+    if(MY_POS) extra = distLabel(haversine(MY_POS.lat, MY_POS.lon, m.lat, m.lon));
+    return `<div class="it"><span>🟢 Mentor ${m.id}</span><span>${extra}</span></div>`;
+  }).join("");
+  return `<div class="radarlist">${rows}</div>`;
+}
+
+// ============ MENTOR: onlayn bo'lish + yordam so'rovlari ============
+let MENTOR_ONLINE = false, MENTOR_WATCH = null;
+function toggleMentorOnline(){
+  if(MENTOR_ONLINE) mentorGoOffline(); else mentorGoOnline();
+}
+let MENTOR_LAST_SENT = 0;
+function mentorGoOnline(){
+  if(!navigator.geolocation){ alert("Bu qurilmada GPS qo'llab-quvvatlanmaydi."); return; }
+  MENTOR_ONLINE = true;
+  MENTOR_LAST_SENT = 0;
+  MENTOR_WATCH = navigator.geolocation.watchPosition(
+    pos => {
+      const now = Date.now();
+      if(now - MENTOR_LAST_SENT < 4000) return;  // serverni haddan tashqari so'rov bilan bosib qolmaslik uchun
+      MENTOR_LAST_SENT = now;
+      api("/api/mentor/beacon", {lat:pos.coords.latitude, lon:pos.coords.longitude}).catch(()=>{});
+    },
+    err => { alert("GPS xatosi: " + err.message + " (HTTPS talab qilinishi mumkin)"); mentorGoOffline(); },
+    {enableHighAccuracy:true, maximumAge:4000, timeout:15000});
+  render();
+}
+function mentorGoOffline(){
+  MENTOR_ONLINE = false;
+  if(MENTOR_WATCH!=null && navigator.geolocation) navigator.geolocation.clearWatch(MENTOR_WATCH);
+  MENTOR_WATCH = null;
+  api("/api/mentor/beacon", {online:false}).catch(()=>{});
+  render();
+}
+function mentorPanel(){
+  const helpEvents = (STATE.log||[]).filter(e=>e.type==="help_request").slice(0,10);
+  const feed = helpEvents.length
+    ? `<div class="helpfeed">${helpEvents.map(e=>{
+        const d = new Date(e.ts*1000);
+        const hh = String(d.getHours()).padStart(2,"0")+":"+String(d.getMinutes()).padStart(2,"0");
+        return `<div class="row">🆘 [${hh}] <b>${e.tname}</b> yordam so'radi</div>`;
+      }).join("")}</div>`
+    : "";
+  return `<div class="onlinebar">
+    <span>${MENTOR_ONLINE ? "🟢 Siz onlaynsiz — lokatsiyangiz radar orqali ko'rinmoqda" : "⚪ Siz oflaynsiz"}</span>
+    <button class="${MENTOR_ONLINE?"bad":"good"}" onclick="toggleMentorOnline()">${MENTOR_ONLINE?"Oflayn bo'lish":"🟢 Onlayn bo'lish"}</button>
+  </div>${feed}`;
+}
+
 // ============ ADMIN: KOORDINATORLAR nazorati ============
 function agoLabel(last_seen){
   if(!last_seen) return "faollik yo'q";
@@ -1011,6 +1444,39 @@ async function reassignCoord(token){
   try{ await api("/api/admin/coord/setloc", {token, loc: sel.value}); await refresh(); }
   catch(e){ alert(e.message); }
 }
+function usersView(){
+  const mentors = (MENTORS && MENTORS.mentors) || [];
+  const mrows = mentors.length
+    ? mentors.map(m=>`<div class="it" style="max-width:none"><span>🟢 Mentor ${m.id}</span>
+        <span>lat ${m.lat.toFixed(5)}, lon ${m.lon.toFixed(5)} · ${agoLabel(m.last_seen)}</span></div>`).join("")
+    : `<div class="card" style="padding:14px; font-family:ui-monospace,monospace">Hozircha onlayn mentor yo'q.</div>`;
+  let urows = `<div class="card" style="padding:18px; font-family:ui-monospace,monospace">
+    Hozircha hech bir foydalanuvchi tizimga kirmagan.</div>`;
+  if(USERS && USERS.users.length){
+    urows = USERS.users.map(u=>{
+      const opts = USERS.teams.map(t=>
+        `<option value="${t.id}" ${t.id===u.team_id?"selected":""}>«${t.name}»</option>`).join("");
+      return `<div class="card" style="padding:12px">
+        <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px">
+          <div><b style="color:${u.team_color||'inherit'}">${u.team_name?"«"+u.team_name+"»":"— tanlanmagan"}</b>
+            <span class="pill">${u.online?"🟢 onlayn":"⚪ "+agoLabel(u.last_seen)}</span></div>
+          <div style="display:flex; gap:6px; flex-wrap:wrap">
+            <select id="usel_${u.token}" style="font-family:ui-monospace,monospace; padding:6px; border:2px solid var(--ink)">${opts}</select>
+            <button class="small" onclick="reassignUser('${u.token}')">O'zgartirish</button>
+          </div>
+        </div>
+        <div style="font-family:ui-monospace,monospace; font-size:9.5px; opacity:.5; margin-top:6px">ID: ${u.token.slice(0,8)}</div>
+      </div>`;
+    }).join("");
+  }
+  return `<h2 class="sec">📡 Onlayn mentorlar (radarda ko'rinadigan)</h2><div class="radarlist" style="max-width:none">${mrows}</div>
+  <h2 class="sec" style="margin-top:18px">Foydalanuvchilar (jamoa a'zolari)</h2>${urows}`;
+}
+async function reassignUser(token){
+  const sel = document.getElementById("usel_"+token);
+  try{ await api("/api/admin/user/setteam", {token, team_id: sel.value}); await refresh(); }
+  catch(e){ alert(e.message); }
+}
 async function exportReport(){
   try{
     const r = await fetch("/api/admin/export", {headers:{"X-Pin":PIN}});
@@ -1027,10 +1493,22 @@ async function exportReport(){
 function boardView(){
   const order = STATE.board.map(id=>STATE.teams.find(t=>t.id===id));
   const medals = ["🥇","🥈","🥉","④","⑤"];
-  const rows = order.map((t,i)=>`<tr><td>${medals[i]||i+1}</td>
-      <td style="color:${t.color};font-weight:bold">«${t.name}»</td>
-      <td>🪙 ${t.coins}</td><td>${fmt(liveTotal(t))}</td><td>${t.status}</td></tr>`).join("");
-  return `<h2 class="sec">Reyting — coin ko'p, vaqt kam</h2>
+  let banner = "";
+  if(ROLE==="user" && MYTEAM){
+    const pos = STATE.board.indexOf(MYTEAM) + 1;
+    const mine = STATE.teams.find(t=>t.id===MYTEAM);
+    if(pos>0 && mine) banner = `<div class="rankbanner">
+      <div class="big">${medals[pos-1]||("#"+pos)} — ${pos}-O'RIN</div>
+      <div class="sm">«${mine.name}» · 🪙 ${mine.coins} coin · ${STATE.teams.length} jamoadan</div>
+      </div>`;
+  }
+  const rows = order.map((t,i)=>{
+    const mine = ROLE==="user" && t.id===MYTEAM;
+    return `<tr class="${mine?"mine":""}"><td>${medals[i]||i+1}</td>
+      <td style="color:${t.color};font-weight:bold">«${t.name}»${mine?" 👉":""}</td>
+      <td>🪙 ${t.coins}</td><td>${fmt(liveTotal(t))}</td><td>${t.status}</td></tr>`;
+  }).join("");
+  return `${banner}<h2 class="sec">Reyting — coin ko'p, vaqt kam</h2>
   <table class="board"><tr><th>#</th><th>Jamoa</th><th>Coin</th><th>Vaqt</th><th>Holat</th></tr>${rows}</table>`;
 }
 function logView(){
@@ -1051,27 +1529,45 @@ function render(){
   let tabs = "";
   if(ROLE==="admin"){
     tabs = `<div class="tabs">
-      <button class="${TAB==="map"?"on":""}" onclick="TAB='map';render()">🗺 XARITA</button>
-      <button class="${TAB==="teams"?"on":""}" onclick="TAB='teams';render()">JAMOALAR</button>
-      <button class="${TAB==="board"?"on":""}" onclick="TAB='board';render()">REYTING</button>
-      <button class="${TAB==="log"?"on":""}" onclick="TAB='log';render()">JURNAL</button>
-      <button class="${TAB==="coords"?"on":""}" onclick="TAB='coords';render()">KOORDINATORLAR</button>
+      <button class="${TAB==="map"?"on":""}" onclick="switchTab('map')">🗺 XARITA</button>
+      <button class="${TAB==="teams"?"on":""}" onclick="switchTab('teams')">JAMOALAR</button>
+      <button class="${TAB==="board"?"on":""}" onclick="switchTab('board')">REYTING</button>
+      <button class="${TAB==="log"?"on":""}" onclick="switchTab('log')">JURNAL</button>
+      <button class="${TAB==="coords"?"on":""}" onclick="switchTab('coords')">KOORDINATORLAR</button>
+      <button class="${TAB==="users"?"on":""}" onclick="switchTab('users')">FOYDALANUVCHILAR</button>
       <button class="small" onclick="exportReport()">⬇ Hisobot</button>
       <button class="bad" onclick="resetAll()">⟲</button>
     </div>`;
+  } else if(ROLE==="user"){
+    tabs = `<div class="tabs">
+      <button class="${TAB==="teams"?"on":""}" onclick="switchTab('teams')">JAMOAM</button>
+      <button class="${TAB==="board"?"on":""}" onclick="switchTab('board')">REYTING</button>
+      <button class="${TAB==="radar"?"on":""}" onclick="switchTab('radar')">📡 MENTOR RADARI</button>
+    </div>`;
+  } else if(ROLE==="mentor"){
+    tabs = `<div class="tabs">
+      <button class="${TAB==="teams"?"on":""}" onclick="switchTab('teams')">JAMOALAR</button>
+      <button class="${TAB==="board"?"on":""}" onclick="switchTab('board')">REYTING</button>
+    </div>`;
   } else {
     tabs = `<div class="tabs">
-      <button class="${TAB==="teams"?"on":""}" onclick="TAB='teams';render()">JAMOALAR</button>
-      <button class="${TAB==="board"?"on":""}" onclick="TAB='board';render()">REYTING</button>
+      <button class="${TAB==="teams"?"on":""}" onclick="switchTab('teams')">JAMOALAR</button>
+      <button class="${TAB==="board"?"on":""}" onclick="switchTab('board')">REYTING</button>
     </div>`;
   }
   let body = "";
   if(TAB==="map") body = mapView();
-  else if(TAB==="teams")
-    body = ROLE==="koordinator" ? koordView() : STATE.teams.map(t=>teamCard(t)).join("");
+  else if(TAB==="teams"){
+    if(ROLE==="koordinator") body = koordView();
+    else if(ROLE==="user") body = userHomeView();
+    else if(ROLE==="mentor") body = mentorPanel() + STATE.teams.map(t=>teamCard(t)).join("");
+    else body = STATE.teams.map(t=>teamCard(t)).join("");
+  }
   else if(TAB==="board") body = boardView();
   else if(TAB==="log") body = logView();
   else if(TAB==="coords") body = coordsView();
+  else if(TAB==="users") body = usersView();
+  else if(TAB==="radar") body = radarView();
   const locBadge = ROLE==="koordinator"
     ? `<span class="pill" title="Lokatsiya faqat admin tomonidan o'zgartiriladi">📍 ${(MYLOC||"?").replace("FINISH · ","🏁 ")}</span>` : "";
   let masterBar = "";
@@ -1087,15 +1583,17 @@ function render(){
   } else {
     masterBar = `<div class="card" style="padding:10px 14px; text-align:center; font-family:ui-monospace,monospace; opacity:.7">⏳ Admin umumiy STARTni kutilmoqda…</div>`;
   }
+  const ROLE_LABEL = {admin:"admin", koordinator:"koordinator", mentor:"mentor", user:"ishtirokchi"}[ROLE] || ROLE;
   $("#app").innerHTML = `
   <header><div class="t">☰ «SOYA»</div>
     <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
-      ${locBadge}<span class="role">${ROLE}</span>
+      ${locBadge}<span class="role">${ROLE_LABEL}</span>
       <button class="small" onclick="logout()">chiqish</button>
     </div></header>
   <main>${masterBar}${tabs}${body}</main>
   <footer><span>Antinarko shtabi · jonli panel</span><span id="clock"></span></footer>`;
   $("#clock").textContent = new Date().toLocaleTimeString("uz-UZ");
+  if(TAB==="radar" && RADAR_ON) renderRadar();
 }
 async function resetAll(){
   if(!confirm("DIQQAT: barcha natijalar o'chiriladi. Davom etilsinmi?")) return;
@@ -1106,7 +1604,7 @@ async function resetAll(){
 function boot(){
   refresh();
   clearInterval(TICK);
-  TICK = setInterval(()=>{ if(STATE && TAB!=="log") render(); }, 1000);
+  TICK = setInterval(()=>{ if(STATE && TAB!=="log" && TAB!=="radar") render(); }, 1000);
   setInterval(refresh, 4000);
 }
 if(PIN && ROLE){
@@ -1120,6 +1618,15 @@ if(PIN && ROLE){
       // tarmoq xatosi: sessiyani buzmaymiz — keshdagi lokatsiya bilan davom etamiz,
       // faqat u ham bo'lmasa loginga qaytamiz.
       if(MYLOC) boot(); else loginView();
+    });
+  } else if(ROLE==="user"){
+    api("/api/user/state").then(us=>{
+      if(us.team_id){ MYTEAM=us.team_id; sessionStorage.setItem("soya_team", MYTEAM); boot(); }
+      else if(MYTEAM){ boot(); }
+      else fetch("/api/login",{method:"POST",headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({pin:PIN})}).then(r=>r.json()).then(d=>teamPicker(d.teams));
+    }).catch(()=>{
+      if(MYTEAM) boot(); else loginView();
     });
   } else boot();
 } else loginView();

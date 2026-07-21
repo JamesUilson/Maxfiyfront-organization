@@ -8,7 +8,8 @@ kirish mumkin (admin, koordinatorlar, mentorlar).
 |---|---|---|
 | ADMIN (shtab) | `2026` | 🗺 Jonli xarita, hamma amallar, ±1 tuzatish, Undo, Reset, koordinatorlar nazorati (lokatsiyasini o'zgartirish), ⬇ natija/jurnal hisobotini ZIP qilib yuklab olish |
 | KOORDINATOR | `1122` | Nuqtasini FAQAT birinchi kirishda tanlaydi (keyin faqat admin o'zgartiradi); ▶ START (jamoa 1-nuqtaga kelganda), 📍 Yetib keldi, 🧩 Kazus, 🏃 Yo'lga chiqdi, 🎭 Xoin hukmi, 🏁 Yakunlash — FAQAT o'z nuqtasidagi jamoa uchun |
-| MENTOR | `3344` | 💡 Ishora (−1 coin) |
+| MENTOR | `3344` | 💡 Ishora (−1 coin), 🟢 Onlayn bo'lish (radarda ko'rinish uchun lokatsiya ulashadi), 🆘 yordam so'rovlari jurnali |
+| ISHTIROKCHI (USER) | `7788` | Kirganda o'z jamoasini FAQAT bir marta tanlaydi; 🏆 Reytingda o'z o'rnini ko'radi, 🆘 Mentordan yordam so'raydi, 📡 Radar orqali onlayn mentorlarni GPS+kompas bilan topadi |
 
 ## Coin tizimi
 - Hududga yetib keldi: **+1**
@@ -89,3 +90,25 @@ Telefonlar shu Wi-Fi/hotspotdagi `http://KOMPYUTER_IP:8100` manziliga kiradi.
   yuklaydi — `natijalar.csv` (jamoalar bo'yicha yakuniy natija: coin, vaqt, bosqichlar,
   xoin hukmi) va `jurnal.csv` (to'liq harakatlar jurnali, ekrandagi so'nggi 50 tadan
   farqli — cheklovsiz).
+
+## v5 yangiliklari — ISHTIROKCHI, REYTING VA MENTOR RADARI
+- 👤 **Yangi rol: ISHTIROKCHI** (`USER_PIN`, `main.py` boshida). Kirganda o'z jamoasini
+  bir marta tanlaydi (qurilmaga qulflanadi — koordinator nuqtasi kabi); admin
+  "FOYDALANUVCHILAR" bo'limidan xato tanlovni tuzatadi.
+- 🏆 **Reyting bannerida o'z o'rni**: ishtirokchi "JAMOAM" va "REYTING" bo'limlarida
+  o'zining N-o'rinini va reytingdagi qatorini ajratilgan holda ko'radi.
+- 🆘 **"Mentordan yordam so'rash" tugmasi**: ishtirokchi bosganda jamoa nomi bilan
+  signal ketadi — mentor ekranida va jurnalda ko'rinadi.
+- 📡 **Mentor radari**: mentor "🟢 Onlayn bo'lish" tugmasini bossa, telefon GPS
+  lokatsiyasini serverga yuboradi. Ishtirokchi "RADAR" bo'limida o'z GPS+kompas
+  (device orientation) yordamida onlayn mentor(lar)gacha bo'lgan MASOFA va
+  YO'NALISHNI (samolyot radari kabi aylanuvchi nur va yorqin nuqta) ko'radi,
+  shu bilan birga kompas ko'rsatkichi ham beriladi.
+  ⚠️ **MUHIM**: GPS (Geolocation) va kompas (DeviceOrientation) ko'pchilik
+  brauzerlarda faqat **HTTPS** (yoki `localhost`) ustida ishlaydi. Oddiy
+  lokal Wi-Fi/hotspot orqali `http://KOMPYUTER_IP:8100` bilan kirilganda bu
+  ruxsat berilmasligi mumkin — radar shunda ham ochiladi, lekin GPS xatosi
+  haqida ogohlantiradi va faqat "onlayn mentorlar" ro'yxatini (yo'nalishsiz)
+  ko'rsatadi. To'liq radar/kompas uchun tadbirni HTTPS orqali (masalan
+  AlwaysData deploy, yoki lokal tarmoq uchun mkcert/ngrok/Tailscale kabi
+  vositalar bilan) joylashtirish tavsiya etiladi.
