@@ -49,6 +49,10 @@ MAP_XY = {
 KOORD_LOCS = ["Befit Eco", "Kuzatuv maydonchasi", "Pirs", "Amfiteatr", "Favvora",
               "Yoga terassasi", "Piknik zonasi", "Ochiq trenajyorlar", FINISH]
 
+# Eco Park haqiqiy GPS markazi (REAL xarita shu nuqtaga markazlashadi)
+# https://yandex.uz/maps/-/CTbSUJ2M
+MAP_CENTER = (41.310891, 69.295064)
+
 COIN_ARRIVE = 1
 COIN_KAZUS  = 1
 COIN_HINT   = -1
@@ -105,6 +109,15 @@ def get_geo_transform(c):
     pts = [(r["lat"], r["lon"], *MAP_XY[r["name"]]) for r in rows if r["name"] in MAP_XY]
     return fit_affine(pts)
 
+def nearest_map_loc(x, y):
+    """Rasm ustidagi (%) x,y nuqtaga eng yaqin nomlangan joyni topadi -> (nom, masofa%)."""
+    best, bestd = None, None
+    for name, (mx, my) in MAP_XY.items():
+        d = ((mx - x) ** 2 + (my - y) ** 2) ** 0.5
+        if bestd is None or d < bestd:
+            best, bestd = name, d
+    return best, bestd
+
 # ================= DB =================
 def db():
     c = sqlite3.connect(DB_PATH)
@@ -142,6 +155,12 @@ def init_db():
     existing_cols = {r["name"] for r in c.execute("PRAGMA table_info(mentors)").fetchall()}
     if "acc" not in existing_cols:
         c.execute("ALTER TABLE mentors ADD COLUMN acc REAL")
+    # v7: koordinatorning ham jonli GPS lokatsiyasi (REAL xaritada aniq ko'rinishi uchun)
+    existing_cols = {r["name"] for r in c.execute("PRAGMA table_info(coordinators)").fetchall()}
+    for col in ("lat REAL", "lon REAL", "acc REAL"):
+        cname = col.split()[0]
+        if cname not in existing_cols:
+            c.execute(f"ALTER TABLE coordinators ADD COLUMN {col}")
     c.commit(); c.close()
 
 init_db()
@@ -243,10 +262,27 @@ def full_state():
     starts = [s["start_ts"] for s in out if s["start_ts"]]
     return {"now": now, "teams": out, "board": [s["id"] for s in board],
             "log": [dict(r) for r in log],
-            "map_xy": MAP_XY, "koord_locs": KOORD_LOCS,
+            "map_xy": MAP_XY, "koord_locs": KOORD_LOCS, "map_center": MAP_CENTER,
             "start_pt": START_PT, "finish_pt": FINISH,
             "global_start_ts": min(starts) if starts else None,
             "all_started": len(starts) == len(out)}
+
+def mask_state_for_user(st):
+    """Ishtirokchi marshrutini (keyingi nuqtalarni) YASHIRADI — ular manzilni
+    joydagi haqiqiy ishoralar asosida topishlari kerak, saytdan emas.
+    Faqat holat, coin, vaqt va reyting ko'rinadi; nuqta NOMLARI olib tashlanadi."""
+    for t in st["teams"]:
+        n = len(t.get("route", []))
+        t["route"] = ["?"] * n
+        t["expected_loc"] = None
+        for s in t.get("stages", []):
+            s["name"] = f'{s["n"]}-nuqta'
+    # xarita/nuqta ma'lumotlari ham ishtirokchiga kerak emas
+    st["map_xy"] = {}
+    st["koord_locs"] = []
+    st["start_pt"] = None
+    st["finish_pt"] = None
+    return st
 
 LABELS = {
     "start": "START — jamoa yo'lga tushdi", "arrive": "Hududga yetib keldi",
@@ -272,8 +308,11 @@ async def login(request: Request):
 
 @app.get("/api/state")
 async def state(request: Request):
-    require(request, ("admin", "koordinator", "mentor", "user"))
-    return JSONResponse(full_state())
+    role = require(request, ("admin", "koordinator", "mentor", "user"))
+    st = full_state()
+    if role == "user":
+        st = mask_state_for_user(st)
+    return JSONResponse(st)
 
 @app.post("/api/action")
 async def action(request: Request):
@@ -517,6 +556,29 @@ async def coord_set_loc(request: Request):
     c.commit(); c.close()
     return {"ok": True}
 
+@app.post("/api/coord/beacon")
+async def coord_beacon(request: Request):
+    require(request, ("koordinator",))
+    body = await request.json()
+    token = request.headers.get("X-Coord-Token", "")
+    if not token:
+        raise HTTPException(400, "Qurilma ID topilmadi")
+    lat, lon = body.get("lat"), body.get("lon")
+    if lat is None or lon is None:
+        raise HTTPException(400, "lat/lon yo'q")
+    acc = body.get("acc")
+    now = time.time()
+    c = db()
+    row = c.execute("SELECT token FROM coordinators WHERE token=?", (token,)).fetchone()
+    if row:
+        c.execute("UPDATE coordinators SET lat=?, lon=?, acc=?, last_seen=? WHERE token=?",
+                  (lat, lon, acc, now, token))
+    else:
+        c.execute("INSERT INTO coordinators(token,lat,lon,acc,last_seen) VALUES(?,?,?,?,?)",
+                  (token, lat, lon, acc, now))
+    c.commit(); c.close()
+    return {"ok": True}
+
 # ================= ADMIN: KOORDINATORLAR NAZORATI =================
 @app.get("/api/admin/coordinators")
 async def admin_coordinators(request: Request):
@@ -613,21 +675,39 @@ async def user_help(request: Request):
 async def admin_users(request: Request):
     require(request, ("admin",))
     c = db()
+    transform = get_geo_transform(c)
     rows = c.execute(
-        "SELECT u.token, u.team_id, u.last_seen, t.name tname, t.color tcolor "
+        "SELECT u.token, u.team_id, u.last_seen, u.lat, u.lon, u.acc, "
+        "t.name tname, t.color tcolor "
         "FROM users u LEFT JOIN teams t ON t.id=u.team_id ORDER BY u.last_seen DESC").fetchall()
     teams = [dict(id=t["id"], name=t["name"], color=t["color"])
              for t in c.execute("SELECT id,name,color FROM teams").fetchall()]
     c.close()
     now = time.time()
+
+    def loc_info(lat, lon):
+        """Foydalanuvchi GPS'ini rasm ustiga proyeksiya qilib, eng yaqin nomlangan joyni beradi."""
+        if transform is None or lat is None or lon is None:
+            return {"pos": None, "near": None, "near_dist": None}
+        x, y = apply_affine(transform, lat, lon)
+        near, d = nearest_map_loc(x, y)
+        return {"pos": {"x": x, "y": y}, "near": near, "near_dist": d}
+
+    def user_out(r):
+        li = loc_info(r["lat"], r["lon"])
+        return {
+            "token": r["token"], "team_id": r["team_id"], "team_name": r["tname"],
+            "team_color": r["tcolor"], "last_seen": r["last_seen"],
+            "online": bool(r["last_seen"] and (now - r["last_seen"]) < 60),
+            "has_gps": r["lat"] is not None and bool(r["last_seen"] and (now - r["last_seen"]) < 90),
+            "lat": r["lat"], "lon": r["lon"], "acc": r["acc"],
+            "pos": li["pos"], "near": li["near"], "near_dist": li["near_dist"],
+        }
+
     return {
-        "users": [
-            {"token": r["token"], "team_id": r["team_id"], "team_name": r["tname"],
-             "team_color": r["tcolor"], "last_seen": r["last_seen"],
-             "online": bool(r["last_seen"] and (now - r["last_seen"]) < 60)}
-            for r in rows
-        ],
+        "users": [user_out(r) for r in rows],
         "teams": teams,
+        "transform_ready": transform is not None,
     }
 
 @app.post("/api/admin/user/setteam")
@@ -769,7 +849,7 @@ async def admin_live_positions(request: Request):
         "FROM users u LEFT JOIN teams t ON t.id=u.team_id").fetchall()
     mentor_rows = c.execute(
         "SELECT token, lat, lon, acc, last_seen FROM mentors ORDER BY token ASC").fetchall()
-    coord_rows = c.execute("SELECT loc, last_seen FROM coordinators").fetchall()
+    coord_rows = c.execute("SELECT loc, lat, lon, acc, last_seen FROM coordinators").fetchall()
     c.close()
 
     def proj(lat, lon):
@@ -795,6 +875,7 @@ async def admin_live_positions(request: Request):
         if r["loc"] and r["loc"] in MAP_XY:
             ix, iy = MAP_XY[r["loc"]]
             coords_out.append({"loc": r["loc"], "x": ix, "y": iy,
+                                "lat": r["lat"], "lon": r["lon"], "acc": r["acc"],
                                 "online": bool(r["last_seen"] and (now - r["last_seen"]) < 60)})
     return {"users": users_out, "mentors": mentors_out, "coordinators": coords_out,
             "transform_ready": transform is not None}
@@ -875,6 +956,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
 <title>«SOYA» · Shtab paneli</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <style>
 :root{ --paper:#efe6cf; --paper2:#f7f1e0; --ink:#2b241a; --line:#6b5327;
   --red:#a11616; --green:#144d33; --amber:#8a6a1a; }
@@ -1171,6 +1254,7 @@ async function setTeam(id, btnEl){
 }
 function logout(){
   if(MENTOR_ONLINE) mentorGoOffline();  // qurilma GPS kuzatuvini to'xtatib, serverga oflayn ekanini bildiradi
+  stopCoordLocationSharing(); stopUserLocationSharing();
   sessionStorage.clear(); PIN=""; ROLE=""; MYLOC=""; MYTEAM="";
   clearInterval(TICK); stopRadar(); loginView();
 }
@@ -1267,7 +1351,7 @@ function teamCard(t, ctx){
       <div><span class="name" style="color:${t.color}">«${t.name}»</span> ${trBadge}
         <div style="margin-top:4px"><span class="status ${t.status}">${t.status.toUpperCase()}</span>
         <span class="pill">💡 ${t.hints}</span>
-        <span class="pill">➜ ${t.expected_loc.replace("FINISH · ","🏁 ")}</span></div></div>
+        ${t.expected_loc?`<span class="pill">➜ ${t.expected_loc.replace("FINISH · ","🏁 ")}</span>`:""}</div></div>
       <div class="coins">🪙 ${t.coins}</div>
     </div>
     <div class="timers">
@@ -1380,8 +1464,69 @@ function interaktivMapView(){
   Kalibrlash: rasm ustiga bossangiz % koordinata ko'rinadi (MAP_XY ga yozish uchun)</div>
   `;
 }
-// ============ REAL XARITA (jonli GPS pozitsiyalari, xuddi shu rasmga proyeksiya) ============
+// ============ REAL XARITA (Leaflet + OpenStreetMap, haqiqiy jonli GPS) ============
+let REAL_MAP = null, REAL_MAP_EL = null, REAL_LAYERS = {};
+function ensureRealMap(){
+  if(REAL_MAP || typeof L === "undefined") return;
+  REAL_MAP_EL = document.createElement("div");
+  REAL_MAP_EL.style.cssText = "width:100%; height:60vh; min-height:340px;";
+  const center = (STATE && STATE.map_center) || [41.310891, 69.295064];
+  REAL_MAP = L.map(REAL_MAP_EL).setView(center, 17);
+  L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+    maxZoom: 19, attribution: "&copy; OpenStreetMap"
+  }).addTo(REAL_MAP);
+  L.marker(center, {icon: L.divIcon({className:"", iconSize:[16,16], iconAnchor:[8,8], html:
+    `<div style="width:16px;height:16px;border-radius:50%;background:#a11616;border:2.5px solid #fff;
+      box-shadow:0 1px 4px rgba(0,0,0,.5)"></div>`})})
+    .addTo(REAL_MAP).bindTooltip("Eco Park");
+}
+function pinIcon(bg, label, square){
+  return L.divIcon({className:"", iconSize:[26,26], iconAnchor:[13,13], html:
+    `<div style="width:26px;height:26px;border-radius:${square?"6px":"50%"};background:${bg};
+      border:2.5px solid #fff; box-shadow:0 1px 4px rgba(0,0,0,.45);
+      display:flex;align-items:center;justify-content:center;color:#fff;
+      font:bold 12px ui-monospace,monospace">${label}</div>`});
+}
+function updateRealMarkers(){
+  if(!REAL_MAP) return;
+  const lp = LIVE_POS || {users:[], mentors:[], coordinators:[]};
+  const seen = new Set();
+  lp.coordinators.forEach(c=>{
+    if(c.lat==null || c.lon==null) return;
+    const key = "coord_"+c.loc; seen.add(key);
+    const icon = pinIcon(c.online?"#144d33":"#6b5327", "K", true);
+    const tip = `Koordinator · ${c.loc.replace("FINISH · ","🏁 ")}${c.acc!=null?` ±${Math.round(c.acc)}m`:""}`;
+    if(REAL_LAYERS[key]){ REAL_LAYERS[key].setLatLng([c.lat,c.lon]); REAL_LAYERS[key].setIcon(icon); REAL_LAYERS[key].setTooltipContent(tip); }
+    else REAL_LAYERS[key] = L.marker([c.lat,c.lon], {icon}).addTo(REAL_MAP).bindTooltip(tip);
+  });
+  lp.mentors.forEach(m=>{
+    if(m.lat==null || m.lon==null) return;
+    const key = "mentor_"+m.id; seen.add(key);
+    const tip = `Mentor ${m.id}${m.acc!=null?` ±${Math.round(m.acc)}m`:""}`;
+    if(REAL_LAYERS[key]){ REAL_LAYERS[key].setLatLng([m.lat,m.lon]); REAL_LAYERS[key].setTooltipContent(tip); }
+    else REAL_LAYERS[key] = L.marker([m.lat,m.lon], {icon: pinIcon("#8a6a1a","M")}).addTo(REAL_MAP).bindTooltip(tip);
+  });
+  lp.users.forEach((u,i)=>{
+    if(u.lat==null || u.lon==null) return;
+    const key = "user_"+(u.token || i); seen.add(key);
+    const icon = pinIcon(u.team_color||"#555", (u.team_name||"?")[0]);
+    const tip = `${u.team_name||"?"}${u.acc!=null?` ±${Math.round(u.acc)}m`:""}`;
+    if(REAL_LAYERS[key]){ REAL_LAYERS[key].setLatLng([u.lat,u.lon]); REAL_LAYERS[key].setIcon(icon); REAL_LAYERS[key].setTooltipContent(tip); }
+    else REAL_LAYERS[key] = L.marker([u.lat,u.lon], {icon}).addTo(REAL_MAP).bindTooltip(tip);
+  });
+  Object.keys(REAL_LAYERS).forEach(key=>{
+    if(!seen.has(key)){ REAL_MAP.removeLayer(REAL_LAYERS[key]); delete REAL_LAYERS[key]; }
+  });
+}
 function realMapView(){
+  ensureRealMap();
+  const noLeaflet = typeof L === "undefined" ? `<div class="card" style="padding:12px; margin-bottom:10px; font-family:ui-monospace,monospace; border-color:var(--red); color:var(--red)">
+    ⚠ Xarita kutubxonasi yuklanmadi — internet aloqasini tekshiring.</div>` : "";
+  const legend = `<div class="maplegend" style="border:2px solid var(--line); border-top:none">
+    <div class="it"><span class="dotc" style="background:#144d33"></span>Koordinator (jonli GPS)</div>
+    <div class="it"><span class="dotc" style="background:#8a6a1a"></span>Mentor (jonli GPS)</div>
+    <div class="it"><span class="dotc" style="background:#555"></span>Jamoa a'zosi (jonli GPS)</div>
+  </div>`;
   const geo = GEOCAL || {points:[], all_locs:[], ready:false, min_needed:3};
   const calibMap = {}; geo.points.forEach(p=>calibMap[p.name]=p);
   const calibRows = geo.all_locs.map(name=>{
@@ -1393,54 +1538,12 @@ function realMapView(){
         ${pt?`<button class="small bad" onclick="removeCalib('${name}')">o'chirish</button>`:""}
       </span></div>`;
   }).join("");
-  const warn = geo.ready ? "" : `<div class="card" style="padding:12px; margin-bottom:10px; font-family:ui-monospace,monospace; border-color:var(--red); color:var(--red)">
-    ⚠ Real xarita ishlashi uchun kamida ${geo.min_needed} nuqtada GPS kalibrlash kerak
-    (hozircha: ${geo.points.length}/${geo.min_needed}). Shu nuqtalarning har birida jismonan turib,
-    pastdagi "📍 Shu yerda GPS olish" tugmasini bosing — yaxshi natija uchun bir-biridan uzoq
-    nuqtalarni tanlang (masalan START, FINISH va o'rtadagi bir nuqta).</div>`;
-
-  const lp = LIVE_POS || {users:[], mentors:[], coordinators:[], transform_ready:false};
-  let marks = "";
-  lp.coordinators.forEach(c=>{
-    marks += `<div class="tmark coordpin" style="left:${clampPct(c.x)}%; top:${clampPct(c.y)}%">
-      <div class="dot" style="background:${c.online?'#144d33':'#6b5327'}">K</div>
-      <div class="tag">Koordinator · ${c.loc.replace("FINISH · ","🏁 ")}</div></div>`;
-  });
-  marks += mentorPinsOverlay();
-  const withPos = lp.users.filter(u=>u.pos);
-  const ugroups = {};
-  withPos.forEach(u=>{
-    const key = Math.round(u.pos.x/2)+"_"+Math.round(u.pos.y/2);
-    (ugroups[key]=ugroups[key]||[]).push(u);
-  });
-  const useen = {};
-  withPos.forEach(u=>{
-    const key = Math.round(u.pos.x/2)+"_"+Math.round(u.pos.y/2);
-    const n = useen[key]||0; useen[key]=n+1;
-    const groupSize = ugroups[key].length;
-    let dx=0, dy=0;
-    if(groupSize>1){
-      const col=n%3, row=Math.floor(n/3);
-      const colsInRow=Math.min(groupSize-row*3,3);
-      dx=(col-(colsInRow-1)/2)*3.2; dy=row*3.2;
-    }
-    marks += `<div class="tmark" style="left:${clampPct(u.pos.x+dx)}%; top:${clampPct(u.pos.y+dy)}%">
-      <div class="dot" style="background:${u.team_color||'#555'}; width:16px; height:16px; font-size:9px">${(u.team_name||"?")[0]}</div>
-      <div class="tag">${u.team_name||"?"}${u.acc!=null?` ±${Math.round(u.acc)}m`:""}</div></div>`;
-  });
-  const legend = `<div class="maplegend" style="border:2px solid var(--line); border-top:none">
-    <div class="it"><span class="dotc" style="background:#144d33"></span>Koordinator (o'z nuqtasida)</div>
-    <div class="it"><span class="dotc" style="background:#8a6a1a"></span>Mentor (jonli GPS)</div>
-    <div class="it"><span class="dotc" style="background:#555"></span>Jamoa a'zosi (jonli GPS)</div>
-  </div>`;
-  const mapBody = !lp.transform_ready ? "" : `
-  <div class="maptools"><h2 class="sec" style="flex:1; margin:0">Eco Park — REAL jonli pozitsiyalar</h2>
+  return noLeaflet + `<div class="maptools"><h2 class="sec" style="flex:1; margin:0">Eco Park — REAL jonli pozitsiyalar</h2>
     <button class="small" onclick="fullMap()">⛶ TABLO</button></div>
-  <div class="mapwrap2" id="realmapwrap">
-    <img src="/pirs.jpg" alt="Eco Park">
-    ${marks}
-  </div>${legend}`;
-  return warn + mapBody + `<div class="sect">🎯 GPS kalibrlash nuqtalari</div>${calibRows}`;
+  <div class="mapwrap2" id="realmapwrap"></div>${legend}
+  <div style="font-family:ui-monospace,monospace; font-size:10.5px; color:#6b5327; margin-top:8px">
+  Belgilar qurilmalarning haqiqiy GPS signalidan jonli yangilanadi (koordinator, mentor va jamoa a'zolari).</div>
+  <div class="sect">🎯 GPS nuqta kalibrlash (INTERAKTIV xaritadagi mentor belgilari uchun)</div>${calibRows}`;
 }
 async function calibrateHere(name){
   if(!navigator.geolocation){ alert("Bu qurilmada GPS mavjud emas."); return; }
@@ -1509,7 +1612,41 @@ function userHomeView(){
   const banner = `<div class="rankbanner">
     <div class="big">${medals[pos-1]||("#"+pos)} — ${pos}-O'RIN</div>
     <div class="sm">${STATE.teams.length} jamoadan · reyting: coin ko'p, vaqt kam</div></div>`;
-  return banner + teamCard(mine);
+  return banner + userTeamCard(mine);
+}
+
+// Ishtirokchi kartasi — MARSHRUT va KEYINGI NUQTA KO'RSATILMAYDI.
+// Ular keyingi manzilni faqat joydagi haqiqiy ishoralar/topshiriqlar asosida topadi.
+function userTeamCard(t){
+  const running = t.status!=="kutmoqda" && t.status!=="yakunlandi";
+  const statusTxt = t.status==="kutmoqda" ? "START kutilmoqda"
+                  : t.status==="yolda"     ? "Yo'lda — keyingi nuqtani izlanglar"
+                  : t.status==="nuqtada"   ? "Nuqtadasiz — topshiriqni bajaring"
+                  : "Yakunlandi";
+  const legTxt = t.status==="yolda" ? "Yo'ldagi vaqt"
+               : t.status==="nuqtada" ? "Nuqtadagi vaqt" : "Joriy";
+  const sos = (t.id===MYTEAM && running)
+    ? `<div class="actions"><button class="sos" onclick="requestHelp()">🆘 Mentordan yordam so'rash</button></div>` : "";
+  const hint = running
+    ? `<div style="margin-top:10px; padding:10px 12px; border:2px dashed var(--ink); border-radius:8px; font-size:13px; line-height:1.4">
+       🧭 <b>Keyingi manzil sayt orqali ko'rsatilmaydi.</b> Uni joydagi ishoralar, topshiriqlar va koordinator ko'rsatmalari asosida toping.</div>` : "";
+  return `
+  <div class="card">
+    ${t.status==="yakunlandi"?'<div class="stamp">YAKUN</div>':""}
+    <div class="bar" style="background:${t.color}"></div>
+    <div class="head">
+      <div><span class="name" style="color:${t.color}">«${t.name}»</span>
+        <div style="margin-top:4px"><span class="status ${t.status}">${statusTxt}</span>
+        <span class="pill">💡 ${t.hints}</span></div></div>
+      <div class="coins">🪙 ${t.coins}</div>
+    </div>
+    <div class="timers">
+      <div class="tm"><div class="lbl">Umumiy vaqt</div><div class="val">${fmt(liveTotal(t))}</div></div>
+      <div class="tm"><div class="lbl">${legTxt}</div><div class="val">${fmt(liveLeg(t))}</div></div>
+    </div>
+    ${hint}
+    ${sos}
+  </div>`;
 }
 let HELP_SENDING = false;
 async function requestHelp(){
@@ -1584,6 +1721,29 @@ function startUserLocationSharing(){
     },
     () => {},
     {enableHighAccuracy:true, maximumAge:2000, timeout:15000});
+}
+// Koordinatorning jonli lokatsiya ulashishi (admin REAL xaritasida "aniq" ko'rinishi uchun) —
+// jamoa a'zolari/mentor bilan bir xil naqsh: fon rejimida, ilovadan chiqmaguncha davom etadi.
+let COORD_LOC_WATCH = null, COORD_LOC_LAST_SENT = 0;
+const smoothCoordPos = makeGeoSmoother();
+function startCoordLocationSharing(){
+  if(COORD_LOC_WATCH != null || !navigator.geolocation) return;
+  COORD_LOC_WATCH = navigator.geolocation.watchPosition(
+    pos => {
+      const acc = pos.coords.accuracy;
+      const sm = smoothCoordPos(pos.coords.latitude, pos.coords.longitude, acc);
+      const now = Date.now();
+      if(now - COORD_LOC_LAST_SENT > 5000){
+        COORD_LOC_LAST_SENT = now;
+        api("/api/coord/beacon", {lat:sm.lat, lon:sm.lon, acc}).catch(()=>{});
+      }
+    },
+    () => {},
+    {enableHighAccuracy:true, maximumAge:4000, timeout:15000});
+}
+function stopCoordLocationSharing(){
+  if(COORD_LOC_WATCH!=null && navigator.geolocation) navigator.geolocation.clearWatch(COORD_LOC_WATCH);
+  COORD_LOC_WATCH = null;
 }
 function stopUserLocationSharing(){
   if(USER_LOC_WATCH!=null && navigator.geolocation) navigator.geolocation.clearWatch(USER_LOC_WATCH);
@@ -1874,27 +2034,65 @@ function usersView(){
     ? mentors.map(m=>`<div class="it" style="max-width:none"><span>🟢 Mentor ${m.id}</span>
         <span>lat ${m.lat.toFixed(5)}, lon ${m.lon.toFixed(5)} · ${agoLabel(m.last_seen)}</span></div>`).join("")
     : `<div class="card" style="padding:14px; font-family:ui-monospace,monospace">Hozircha onlayn mentor yo'q.</div>`;
-  let urows = `<div class="card" style="padding:18px; font-family:ui-monospace,monospace">
+  // ---- bitta foydalanuvchi kartasi (aniq lokatsiyasi bilan) ----
+  function userCard(u){
+    const opts = USERS.teams.map(t=>
+      `<option value="${t.id}" ${t.id===u.team_id?"selected":""}>«${t.name}»</option>`).join("");
+    // lokatsiya satri — kalibrlash SHART EMAS, jonli GPS to'g'ridan-to'g'ri ko'rinadi
+    let locLine;
+    if(u.has_gps){
+      const acc = (u.acc!=null) ? ` <span style="opacity:.6">±${Math.round(u.acc)}m</span>` : "";
+      const nm = u.near ? ` · ${u.near.replace("FINISH · ","🏁 ")} yaqinida` : "";
+      const coords = (u.lat!=null&&u.lon!=null)
+        ? `<div style="font-family:ui-monospace,monospace; font-size:10px; opacity:.55; margin-top:2px">${u.lat.toFixed(5)}, ${u.lon.toFixed(5)}</div>` : "";
+      const gmap = (u.lat!=null&&u.lon!=null)
+        ? `<a href="https://www.google.com/maps?q=${u.lat},${u.lon}" target="_blank" rel="noopener"
+             style="display:inline-block; margin-top:4px; font-size:12px; font-weight:bold; color:var(--blue,#1f3a6e)">🗺 Xaritada ochish →</a>` : "";
+      locLine = `<div style="margin-top:6px; font-weight:bold; color:var(--green)">📍 Jonli GPS${acc}${nm}</div>${coords}${gmap}`;
+    } else if(u.online){
+      locLine = `<div style="margin-top:6px; opacity:.7">📡 Onlayn — telefonida lokatsiyaga ruxsat (allow) berilishi kutilmoqda…</div>`;
+    } else {
+      locLine = `<div style="margin-top:6px; opacity:.5">⚪ Oflayn — oxirgi lokatsiya yo'q</div>`;
+    }
+    return `<div class="card" style="padding:12px">
+      <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px">
+        <div><b style="color:${u.team_color||'inherit'}">${u.team_name?"«"+u.team_name+"»":"— tanlanmagan"}</b>
+          <span class="pill">${u.online?"🟢 onlayn":"⚪ "+agoLabel(u.last_seen)}</span></div>
+        <div style="display:flex; gap:6px; flex-wrap:wrap">
+          <select id="usel_${u.token}" style="font-family:ui-monospace,monospace; padding:6px; border:2px solid var(--ink)">${opts}</select>
+          <button class="small" onclick="reassignUser('${u.token}')">O'zgartirish</button>
+        </div>
+      </div>
+      ${locLine}
+      <div style="font-family:ui-monospace,monospace; font-size:9.5px; opacity:.5; margin-top:6px">ID: ${u.token.slice(0,8)}</div>
+    </div>`;
+  }
+
+  let ublock = `<div class="card" style="padding:18px; font-family:ui-monospace,monospace">
     Hozircha hech bir foydalanuvchi tizimga kirmagan.</div>`;
   if(USERS && USERS.users.length){
-    urows = USERS.users.map(u=>{
-      const opts = USERS.teams.map(t=>
-        `<option value="${t.id}" ${t.id===u.team_id?"selected":""}>«${t.name}»</option>`).join("");
-      return `<div class="card" style="padding:12px">
-        <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px">
-          <div><b style="color:${u.team_color||'inherit'}">${u.team_name?"«"+u.team_name+"»":"— tanlanmagan"}</b>
-            <span class="pill">${u.online?"🟢 onlayn":"⚪ "+agoLabel(u.last_seen)}</span></div>
-          <div style="display:flex; gap:6px; flex-wrap:wrap">
-            <select id="usel_${u.token}" style="font-family:ui-monospace,monospace; padding:6px; border:2px solid var(--ink)">${opts}</select>
-            <button class="small" onclick="reassignUser('${u.token}')">O'zgartirish</button>
-          </div>
-        </div>
-        <div style="font-family:ui-monospace,monospace; font-size:9.5px; opacity:.5; margin-top:6px">ID: ${u.token.slice(0,8)}</div>
+    // JAMOA bo'yicha guruhlab ko'rsatamiz
+    const groups = [];
+    USERS.teams.forEach(t=>{
+      const mem = USERS.users.filter(u=>u.team_id===t.id);
+      if(mem.length) groups.push({name:"«"+t.name+"»", color:t.color, mem});
+    });
+    const noteam = USERS.users.filter(u=>!u.team_id);
+    if(noteam.length) groups.push({name:"— jamoa tanlanmagan", color:"#888", mem:noteam});
+    ublock = groups.map(g=>{
+      const online = g.mem.filter(u=>u.online).length;
+      return `<div style="margin-top:14px">
+        <div class="sect" style="border-left:4px solid ${g.color}; padding-left:8px; display:flex; justify-content:space-between; align-items:center">
+          <span style="color:${g.color}; font-weight:bold">${g.name}</span>
+          <span class="pill">👥 ${g.mem.length} · 🟢 ${online}</span></div>
+        ${g.mem.map(userCard).join("")}
       </div>`;
     }).join("");
   }
+  const mapNote = `<div class="card" style="padding:10px 14px; margin-top:8px; font-size:12px; opacity:.85">
+     🗺 Hammani bitta jonli xaritada ko'rish uchun: <b>XARITA → REAL (GPS)</b> bo'limi — kalibrlash shart emas.</div>`;
   return `<h2 class="sec">📡 Onlayn mentorlar (radarda ko'rinadigan)</h2><div class="radarlist" style="max-width:none">${mrows}</div>
-  <h2 class="sec" style="margin-top:18px">Foydalanuvchilar (jamoa a'zolari)</h2>${urows}`;
+  <h2 class="sec" style="margin-top:18px">Foydalanuvchilar — jamoa va jonli lokatsiya bo'yicha</h2>${mapNote}${ublock}`;
 }
 async function reassignUser(token){
   const sel = document.getElementById("usel_"+token);
@@ -2020,6 +2218,17 @@ function render(){
   // rAF sikli o'z-o'zidan davom etadi (har freymda canvas'ni ID orqali qayta topadi);
   // faqat u qandaydir sababga ko'ra to'xtab qolgan bo'lsa qayta ishga tushiramiz.
   if(TAB==="radar" && RADAR_ON && !RADAR_RAF){ RADAR_T0 = 0; RADAR_RAF = requestAnimationFrame(radarLoop); }
+  // Leaflet xaritasi #app innerHTML bilan birga o'chib ketmasligi uchun — bir marta
+  // yaratilgan xarita DOM tugunini (REAL_MAP_EL) har render()da joriy joyiga qayta ilamiz
+  // (qayta yaratmaymiz — aks holda zoom/pan holati va tayl keshi har safar yo'qolib qoladi).
+  if(TAB==="map" && MAP_MODE==="real"){
+    const host = document.getElementById("realmapwrap");
+    if(host && REAL_MAP_EL){
+      host.appendChild(REAL_MAP_EL);
+      if(REAL_MAP) REAL_MAP.invalidateSize();
+    }
+    updateRealMarkers();
+  }
 }
 async function resetAll(){
   if(!confirm("DIQQAT: barcha natijalar o'chiriladi. Davom etilsinmi?")) return;
@@ -2030,9 +2239,14 @@ async function resetAll(){
 function boot(){
   refresh();
   clearInterval(TICK);
-  TICK = setInterval(()=>{ if(STATE && TAB!=="log" && TAB!=="radar") render(); }, 1000);
+  // REAL (Leaflet) xarita ochiq bo'lsa har soniya to'liq qayta chizmaymiz — u faqat
+  // refresh() davridan (4s) yangilanadi, aks holda xarita har soniya "sakraydi".
+  TICK = setInterval(()=>{
+    if(STATE && TAB!=="log" && TAB!=="radar" && !(TAB==="map" && MAP_MODE==="real")) render();
+  }, 1000);
   setInterval(refresh, 4000);
   if(ROLE==="user") startUserLocationSharing();  // admin REAL xaritasi uchun jonli GPS
+  if(ROLE==="koordinator") startCoordLocationSharing();  // admin REAL xaritasida aniq ko'rinishi uchun
 }
 if(PIN && ROLE){
   if(ROLE==="koordinator"){
